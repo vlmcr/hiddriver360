@@ -11,6 +11,7 @@
 #include "hid_parser.h"  
 #include "usb.h"
 #include "mapping.h"
+#include "gip.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -278,6 +279,19 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+
+	// GIP (Xbox One / Xbox Series) specific state, unused for HID controllers
+	bool isGip;
+	uint16_t gipInPacketSize;
+	UsbTrb gipOutTrb;                 // interrupt OUT endpoint
+	uint8_t* gipOutBuffer;            // buffer of the OUT transfer currently in flight
+	volatile LONG gipOutBusy;         // 1 while an OUT transfer is in flight
+	uint8_t gipOutSerial;             // running sequence number for host packets
+	uint8_t gipOutHead;
+	uint8_t gipOutCount;
+	struct { uint8_t data[GIP_MAX_PACKET]; uint8_t length; } gipOutQueue[GIP_OUT_QUEUE_DEPTH];
+	volatile LONG gipRumblePending;   // 1 when gipRumble[] holds a value not yet sent
+	uint8_t gipRumble[2];             // left (strong), right (weak), 0..100
 } __declspec(align(4));
 
 struct MappingState {
@@ -392,6 +406,300 @@ void SendInterruptRequest(
 int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
+
+// ---- GIP (Xbox One / Xbox Series controllers) specific start ----
+//
+// These pads are not HID. They use Microsoft's vendor specific GIP protocol on
+// an interrupt IN / interrupt OUT endpoint pair (interface class 0xFF, subclass
+// 0x47, protocol 0xD0). The HID code path is untouched: GIP devices get their
+// own init callback, their own packet parser and an OUT queue for the packets
+// the host has to send (power on, acks, rumble).
+
+bool IsGipInterface(usb_interface_descriptor* iface) {
+	return iface &&
+		iface->bInterfaceClass == GIP_INTERFACE_CLASS &&
+		iface->bInterfaceSubClass == GIP_INTERFACE_SUBCLASS &&
+		iface->bInterfaceProtocol == GIP_INTERFACE_PROTOCOL;
+}
+
+int GipFindControllerByOutTrb(void* trb) {
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (connectedControllers[i].controllerDriver && &connectedControllers[i].gipOutTrb == trb)
+			return i;
+	}
+	return -1;
+}
+
+int32_t gipOutCompleteHandler(DWORD trbPtr, int32_t status);
+
+// Send the next queued packet if the OUT endpoint is idle. Safe to call from
+// any context: the endpoint is claimed with an interlocked flag so only one
+// caller ever starts a transfer.
+void GipPumpOut(int index) {
+	Controller& ctl = connectedControllers[index];
+	if (!ctl.controllerDriver || !ctl.isGip || !ctl.gipOutBuffer)
+		return;
+
+	if (ctl.gipOutCount == 0 && !ctl.gipRumblePending)
+		return;
+
+	if (InterlockedCompareExchange(&ctl.gipOutBusy, 1, 0) != 0)
+		return; // transfer in flight, completion handler will call us again
+
+	uint8_t length = 0;
+	if (ctl.gipOutCount > 0) {
+		length = ctl.gipOutQueue[ctl.gipOutHead].length;
+		memcpy(ctl.gipOutBuffer, ctl.gipOutQueue[ctl.gipOutHead].data, length);
+		ctl.gipOutHead = (ctl.gipOutHead + 1) % GIP_OUT_QUEUE_DEPTH;
+		ctl.gipOutCount--;
+	}
+	else if (InterlockedExchange(&ctl.gipRumblePending, 0) != 0) {
+		length = sizeof(gip_rumble_template);
+		memcpy(ctl.gipOutBuffer, gip_rumble_template, length);
+		ctl.gipOutBuffer[2] = ctl.gipOutSerial++;
+		ctl.gipOutBuffer[GIP_RUMBLE_LEFT] = ctl.gipRumble[0];
+		ctl.gipOutBuffer[GIP_RUMBLE_RIGHT] = ctl.gipRumble[1];
+	}
+
+	if (length == 0) {
+		InterlockedExchange(&ctl.gipOutBusy, 0);
+		return;
+	}
+
+	SendInterruptRequest(ctl.deviceHandle, &ctl.gipOutTrb, ctl.gipOutBuffer, length, (DWORD)gipOutCompleteHandler);
+}
+
+int32_t gipOutCompleteHandler(DWORD trbPtr, int32_t status) {
+	int index = GipFindControllerByOutTrb((void*)trbPtr);
+	if (index < 0)
+		return 0;
+
+	if (status != 0)
+		DbgPrint("EINTIM: GIP OUT transfer failed with status %x\n", status);
+
+	InterlockedExchange(&connectedControllers[index].gipOutBusy, 0);
+	GipPumpOut(index);
+	return 0;
+}
+
+// Queue a host -> pad packet. When stampSerial is set, byte [2] gets the next
+// sequence number (init packets, rumble). Acks carry the sequence number of
+// the packet they acknowledge instead.
+void GipQueuePacket(int index, const uint8_t* data, uint8_t length, bool stampSerial) {
+	Controller& ctl = connectedControllers[index];
+	if (length == 0 || length > GIP_MAX_PACKET)
+		return;
+	if (ctl.gipOutCount >= GIP_OUT_QUEUE_DEPTH) {
+		DbgPrint("EINTIM: GIP OUT queue full, dropping packet %02x\n", data[0]);
+		return;
+	}
+
+	uint8_t tail = (ctl.gipOutHead + ctl.gipOutCount) % GIP_OUT_QUEUE_DEPTH;
+	memcpy(ctl.gipOutQueue[tail].data, data, length);
+	ctl.gipOutQueue[tail].length = length;
+	if (stampSerial)
+		ctl.gipOutQueue[tail].data[2] = ctl.gipOutSerial++;
+	ctl.gipOutCount++;
+
+	GipPumpOut(index);
+}
+
+void GipQueueInitPackets(int index) {
+	Controller& ctl = connectedControllers[index];
+	for (int i = 0; i < (sizeof(gip_init_packets) / sizeof(gip_init_packets[0])); i++) {
+		const GipInitPacket& p = gip_init_packets[i];
+		if (p.vendorId != 0 && p.vendorId != ctl.vendorId)
+			continue;
+		if (p.productId != 0 && p.productId != ctl.productId)
+			continue;
+		DbgPrint("EINTIM: GIP queueing init packet %02x\n", p.data[0]);
+		GipQueuePacket(index, p.data, p.length, true);
+	}
+}
+
+void GipSetRumble(int index, uint8_t left, uint8_t right) {
+	Controller& ctl = connectedControllers[index];
+	ctl.gipRumble[0] = left;
+	ctl.gipRumble[1] = right;
+	InterlockedExchange(&ctl.gipRumblePending, 1);
+	GipPumpOut(index);
+}
+
+static inline int16_t gip_s16(const uint8_t* p) {
+	return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static inline uint16_t gip_u16(const uint8_t* p) {
+	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+// Parse one packet received on the interrupt IN endpoint.
+void GipProcessPacket(int index, const uint8_t* data, uint32_t bufferLength) {
+	Controller& ctl = connectedControllers[index];
+	if (bufferLength < 4)
+		return;
+
+	uint8_t command = data[0];
+	uint8_t options = data[1];
+	uint8_t sequence = data[2];
+	uint8_t payloadLength = data[3];
+	if ((uint32_t)payloadLength + 4 > bufferLength)
+		payloadLength = (uint8_t)(bufferLength - 4);
+
+	switch (command) {
+	case GIP_CMD_INPUT: {
+		if (payloadLength < GIP_INPUT_MIN_PAYLOAD)
+			return;
+
+		ButtonsReport r;
+		memset(&r, 0, sizeof(ButtonsReport));
+
+		uint8_t b0 = data[GIP_INPUT_BUTTONS0];
+		uint8_t b1 = data[GIP_INPUT_BUTTONS1];
+
+		r.a_button = (b0 & GIP_BTN0_A) ? 1 : 0;
+		r.b_button = (b0 & GIP_BTN0_B) ? 1 : 0;
+		r.x_button = (b0 & GIP_BTN0_X) ? 1 : 0;
+		r.y_button = (b0 & GIP_BTN0_Y) ? 1 : 0;
+		r.start    = (b0 & GIP_BTN0_MENU) ? 1 : 0;
+		r.back     = (b0 & GIP_BTN0_VIEW) ? 1 : 0;
+
+		r.has_hat_switch = false;
+		r.dpad_up    = (b1 & GIP_BTN1_DPAD_UP) ? 1 : 0;
+		r.dpad_down  = (b1 & GIP_BTN1_DPAD_DOWN) ? 1 : 0;
+		r.dpad_left  = (b1 & GIP_BTN1_DPAD_LEFT) ? 1 : 0;
+		r.dpad_right = (b1 & GIP_BTN1_DPAD_RIGHT) ? 1 : 0;
+		r.l1 = (b1 & GIP_BTN1_LB) ? 1 : 0;
+		r.r1 = (b1 & GIP_BTN1_RB) ? 1 : 0;
+		r.l3 = (b1 & GIP_BTN1_LS) ? 1 : 0;
+		r.r3 = (b1 & GIP_BTN1_RS) ? 1 : 0;
+
+		// Triggers are 10 bit, XInputdReadStateHook expects 0..255 in rx / ry
+		r.rx = (int16_t)(gip_u16(data + GIP_INPUT_LT) >> 2);
+		r.ry = (int16_t)(gip_u16(data + GIP_INPUT_RT) >> 2);
+
+		// Sticks are already signed 16 bit with up = positive, same as XInput
+		r.x  = gip_s16(data + GIP_INPUT_LX);
+		r.y  = gip_s16(data + GIP_INPUT_LY);
+		r.z  = gip_s16(data + GIP_INPUT_RX);
+		r.rz = gip_s16(data + GIP_INPUT_RY);
+
+		// Guide state arrives in its own packet, keep whatever we have
+		r.xbox = ctl.currentState.xbox;
+		if (b0 & GIP_BTN0_GUIDE)
+			r.xbox = 1;
+
+		ctl.currentState = r;
+		break;
+	}
+
+	case GIP_CMD_VIRTUAL_KEY: {
+		if (payloadLength < 1)
+			return;
+		// Pads that request an ack re-send the packet until they get one
+		if (options & GIP_OPT_ACK) {
+			uint8_t ack[sizeof(gip_virtual_key_ack)];
+			memcpy(ack, gip_virtual_key_ack, sizeof(ack));
+			ack[2] = sequence;
+			GipQueuePacket(index, ack, sizeof(ack), false);
+		}
+		ctl.currentState.xbox = (data[4] & 0x01) ? 1 : 0;
+		break;
+	}
+
+	case GIP_CMD_ANNOUNCE:
+		// The pad (re)announced itself, e.g. after an internal reset. Power it
+		// on again so it resumes sending input.
+		DbgPrint("EINTIM: GIP announce from %04x:%04x\n", ctl.vendorId, ctl.productId);
+		GipQueueInitPackets(index);
+		break;
+
+	default:
+		break;
+	}
+}
+
+// Completion of SET_CONFIGURATION for a GIP pad. Mirrors the tail of
+// setConfigurationComplete, minus everything HID report descriptor related.
+int32_t gipSetConfigurationComplete(DWORD deviceHandle, int32_t status) {
+	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
+
+	if (status != 0) {
+		DbgPrint("EINTIM: GIP SET_CONFIGURATION failed with status %x!\n", status);
+		return status;
+	}
+
+	usb_endpoint_descriptor* inDescriptor = UsbdGetEndpointDescriptor(
+		controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
+	usb_endpoint_descriptor* outDescriptor = UsbdGetEndpointDescriptor(
+		controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+
+	if (!inDescriptor || !outDescriptor) {
+		DbgPrint("EINTIM: GIP pad without interrupt IN/OUT endpoint pair, giving up\n");
+		return -1;
+	}
+
+	status = UsbdOpenEndpoint(
+		controllerDriver->deviceHandle,
+		3,
+		inDescriptor->bEndpointAddress,
+		swap_endianness_16(inDescriptor->wMaxPacketSize) & 0x7FF,
+		inDescriptor->bInterval,
+		(DWORD*)&controllerDriver->interruptTrb);
+
+	if (NT_ERROR(status)) {
+		DbgPrint("EINTIM: Failed to open GIP interrupt IN endpoint %x!\n", status);
+		return status;
+	}
+
+	uint16_t pktSize = swap_endianness_16(inDescriptor->wMaxPacketSize) & 0x7FF;
+	if (pktSize == 0 || pktSize > GIP_MAX_PACKET)
+		pktSize = GIP_MAX_PACKET;
+
+	c.reportData = malloc(pktSize * 2);
+	memset(c.reportData, 0, pktSize * 2);
+	c.gipInPacketSize = pktSize;
+	c.gipOutBuffer = (uint8_t*)malloc(GIP_MAX_PACKET);
+	memset(c.gipOutBuffer, 0, GIP_MAX_PACKET);
+
+	controllerDriver->interruptTrb.savedEndpoint = controllerDriver->interruptTrb.endpoint;
+	controllerDriver->interruptTrb.length = pktSize;
+	controllerDriver->interruptTrb.callback = (DWORD)interruptHandler;
+	controllerDriver->interruptTrb.buffer = c.reportData;
+
+	c.controllerDriver = controllerDriver;
+
+	uint8_t  userIndex = -1;
+	uint32_t context = 0x0000000010000005 + globalIndex;
+	XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
+	c.userIndex = userIndex;
+	c.deviceContext = context;
+	connectedControllers[globalIndex] = c;
+
+	DbgPrint("EINTIM: Registered GIP controller %04x:%04x inside XAM with index: %d.\n",
+		c.vendorId, c.productId, userIndex);
+
+	// OUT endpoint is opened on the final Controller slot, like the Switch Pro path does
+	Controller& ctl = connectedControllers[globalIndex];
+	status = UsbdOpenEndpoint(
+		controllerDriver->deviceHandle,
+		3,
+		outDescriptor->bEndpointAddress,
+		swap_endianness_16(outDescriptor->wMaxPacketSize) & 0x7FF,
+		outDescriptor->bInterval,
+		(DWORD*)&ctl.gipOutTrb);
+
+	if (NT_ERROR(status)) {
+		DbgPrint("EINTIM: Failed to open GIP interrupt OUT endpoint %x!\n", status);
+		return status;
+	}
+
+	GipQueueInitPackets(globalIndex);
+
+	return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
+}
+
+// ---- GIP specific end ----
 
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
@@ -1001,6 +1309,13 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 		}
 	}
 
+	if (index >= 0 && connectedControllers[index].isGip) {
+		GipProcessPacket(index, (const uint8_t*)driverExtension->interruptTrb.buffer, connectedControllers[index].gipInPacketSize);
+		// Packet sizes vary on GIP, make sure the next transfer always asks for a full packet
+		driverExtension->interruptTrb.length = connectedControllers[index].gipInPacketSize;
+		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
+	}
+
 	if (NeedsNintendoHandshake(connectedControllers[index].vendorId, connectedControllers[index].productId) && connectedControllers[index].nintendo_handshake_state != DONE) {
 		if (connectedControllers[index].nintendo_handshake_state == INITIAL) {
 			DbgPrint("EINTIM: Gotta do nintendo handshake for this one!\r\n");
@@ -1196,6 +1511,10 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 		}
 		// Clear mapping data
 		connectedControllers[index].map = nullptr;
+		if (connectedControllers[index].gipOutBuffer) {
+			free(connectedControllers[index].gipOutBuffer);
+			connectedControllers[index].gipOutBuffer = nullptr;
+		}
 		memset(&connectedControllers[index], 0, sizeof(Controller));
 		delete deviceHandle2->driver;
 		deviceHandle2->driver = nullptr;
@@ -1222,6 +1541,66 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: IS USB1.0: %d\n", isOhci);
 	DbgPrint("EINTIM: USB device descriptor Pointer: %p\n", device_descriptor);
 	DbgPrint("EINTIM: HID device vendor id: %x, product id: %x\n", vendorId, productId);
+	DbgPrint("EINTIM: Interface %d class %02x subclass %02x protocol %02x\n",
+		interface_descriptor->bInterfaceNumber, interface_descriptor->bInterfaceClass,
+		interface_descriptor->bInterfaceSubClass, interface_descriptor->bInterfaceProtocol);
+
+	// Xbox One / Series pads expose three GIP interfaces, the gamepad is interface 0
+	if (IsGipInterface(interface_descriptor) && interface_descriptor->bInterfaceNumber == 0) {
+		DbgPrint("EINTIM: GIP controller detected. Initialising GIP handler.\n");
+
+		int index = -1;
+		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+			if (!connectedControllers[i].controllerDriver) {
+				DbgPrint("Assigning GIP controller to index %d\n", i);
+				index = i;
+				break;
+			}
+		}
+
+		if (index == -1) {
+			DbgPrint("EINTIM: No free index!\n");
+			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+		}
+		globalIndex = index;
+
+		c = Controller();
+		memset(&c, 0, sizeof(Controller));
+		c.isGip = true;
+		c.vendorId = vendorId;
+		c.productId = productId;
+		c.map = nullptr;        // no HID mapping, keeps the mapping assistant away
+		c.reportInfo = nullptr;
+		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::DONE;
+
+		HidControllerExtension* controllerDriver = new HidControllerExtension();
+		c.deviceHandle = deviceHandle;
+		controllerDriver->deviceType = 0;
+		deviceHandle->driver = controllerDriver;
+		controllerDriver->deviceHandle = deviceHandle;
+		controllerDriver->interfaceNumber = interface_descriptor->bInterfaceNumber;
+		controllerDriver->interruptTrb.flags = 1;
+
+		UsbdAddDeviceComplete(deviceHandle, 0);
+
+		NTSTATUS status = UsbdOpenDefaultEndpoint(deviceHandle, (DWORD*)&controllerDriver->controlTrb);
+		if (NT_ERROR(status)) {
+			DbgPrint("EINTIM: Failed to open control endpoint %x!\n", status);
+			return status;
+		}
+
+		DbgPrint("EINTIM: Sending SET_CONFIGURATION (GIP)\n");
+		SendControlRequest(
+			controllerDriver->deviceHandle,
+			&controllerDriver->controlTrb,
+			0x00,
+			0x09,
+			1, 0, 0,
+			nullptr,
+			(DWORD)gipSetConfigurationComplete);
+
+		return 0;
+	}
 
 	if (interface_descriptor->bInterfaceClass == 0x03 &&
 		interface_descriptor->bInterfaceSubClass == 0 &&
@@ -1321,6 +1700,16 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 		}
 		if (!c)
 			return status;
+#if HIDDRIVER_GIP_RUMBLE
+		if (c->isGip && pInputState) {
+			// Third argument is really an XINPUT_VIBRATION (0..65535 per motor),
+			// GIP wants 0..100 per motor.
+			XINPUT_VIBRATION* vibration = (XINPUT_VIBRATION*)pInputState;
+			uint8_t left = (uint8_t)(((uint32_t)vibration->wLeftMotorSpeed * 100) / 65535);
+			uint8_t right = (uint8_t)(((uint32_t)vibration->wRightMotorSpeed * 100) / 65535);
+			GipSetRumble((int)(c - connectedControllers), left, right);
+		}
+#endif
 		return ERROR_SUCCESS;
 	}
 

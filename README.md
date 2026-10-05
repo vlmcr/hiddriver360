@@ -9,7 +9,7 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - The controller works in all tested games
 
 ## Current limitations
-- no rumble support
+- no rumble support for HID controllers (GIP pads do rumble, see below)
 
 ## Supported controllers
 - DualShock 4 (PS4 controller)
@@ -18,7 +18,32 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - DualSense Edge
 - DualShock 3
 - Nintendo Switch Pro controller
-- Any USB HID compliant controller thanks to built in mapping assistant :) (this excludes modern xbox controllers like xbox one and xbox series because microsoft made them GIP only)
+- Any USB HID compliant controller thanks to built in mapping assistant :)
+- Xbox One / Xbox Series controllers over USB (GIP, see below) - experimental
+
+## Xbox One / Series (GIP) support
+Modern Xbox pads are not HID, they talk Microsoft's vendor specific GIP protocol
+(interface class 0xFF, subclass 0x47, protocol 0xD0). This fork adds a second,
+independent code path for them next to the HID one:
+
+- detected by interface class, so official pads (Xbox One, One S, Series X|S, Elite 2) and licensed third party GIP pads are picked up
+- power on / vendor init packets mirror the Linux `xpad` driver (`gip.h`)
+- input report `0x20` is parsed into the same `ButtonsReport` the HID path uses, so XAM registration, ring of light and games behave exactly like for the other pads
+- guide button packets (`0x07`) are acknowledged, otherwise the pad keeps re-sending them
+- rumble from `XamInputSetState` is translated into GIP `0x09` packets (disable with `HIDDRIVER_GIP_RUMBLE 0`)
+- Bluetooth is not covered, the console has no Bluetooth stack; plug the pad in with a USB cable
+
+Tested descriptor of a Series X|S pad (model 1914, `045e:0b12`) is in
+`tools/model1914_series_descriptor.txt`, dumped with `tools/usb_descriptor_dump.py`
+on Windows. Interface 0 (alt 0) is the gamepad with interrupt OUT `0x02` and
+interrupt IN `0x82`, interfaces 1 and 2 are audio and bulk and are ignored.
+
+Known unknown: the driver hooks the kernel HID class driver's AddDevice. If the
+360 USB stack routes vendor class devices somewhere else, the GIP pad never
+reaches that hook. The hook now logs the class/subclass/protocol of every device
+it sees (`EINTIM: Interface N class ...`), so a debug log tells you right away
+whether the pad arrives. If it does not, the match has to move one level up,
+to the point where USBD picks a class driver.
 
 ## How to use
 1. load plugin (either at runtime or at boot via your launch.ini)

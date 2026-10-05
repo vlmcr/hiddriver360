@@ -1,0 +1,17 @@
+Device 045E:0B12 on hub port 5: USB 2.0 full-speed, device class=0xFF/0x47/0xD0, ep0 maxPacket=64, bcdDevice=0x0501
+CONFIG  total=119 interfaces=3 value=1 attr=0xa0 power=500mA
+  INTERFACE 0 alt=0 endpoints=2 class=0xFF subclass=0x47 protocol=0xD0
+    ENDPOINT 0x02 OUT interrupt maxPacket=64 interval=4
+    ENDPOINT 0x82 IN  interrupt maxPacket=64 interval=4
+  INTERFACE 0 alt=1 endpoints=2 class=0xFF subclass=0x47 protocol=0xD0
+    ENDPOINT 0x02 OUT interrupt maxPacket=64 interval=4
+    ENDPOINT 0x82 IN  interrupt maxPacket=64 interval=2
+  INTERFACE 1 alt=0 endpoints=0 class=0xFF subclass=0x47 protocol=0xD0
+  INTERFACE 1 alt=1 endpoints=2 class=0xFF subclass=0x47 protocol=0xD0
+    ENDPOINT 0x03 OUT isochronous maxPacket=228 interval=1
+    ENDPOINT 0x83 IN  isochronous maxPacket=64 interval=1
+  INTERFACE 2 alt=0 endpoints=0 class=0xFF subclass=0x47 protocol=0xD0
+  INTERFACE 2 alt=1 endpoints=2 class=0xFF subclass=0x47 protocol=0xD0
+    ENDPOINT 0x04 OUT bulk maxPacket=64 interval=0
+    ENDPOINT 0x84 IN  bulk maxPacket=64 interval=0
+raw: 09027700030100a0fa0904000002ff47d00007050203400004070582034000040904000102ff47d00007050203400004070582034000020904010000ff47d0000904010102ff47d00007050301e40001070583014000010904020000ff47d0000904020102ff47d0000705040240000007058402400000
