@@ -42,6 +42,64 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 
 void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, XUSER_INDEX_ANY, XNOTIFYUI_PRIORITY_DEFAULT, String, 0); }
 
+// ---- diagnostics: mirror DbgPrint output to HDD:\hiddriver.log ----
+// Every DbgPrint in this file still goes to the debug monitor; in addition the
+// line is stored in a ring buffer that a low priority thread appends to a file
+// every half second. Lets you read the driver log over FTP on consoles without
+// xbdm / UART. Disable with HIDDRIVER_FILELOG 0.
+#ifndef HIDDRIVER_FILELOG
+#define HIDDRIVER_FILELOG 1
+#endif
+#if HIDDRIVER_FILELOG
+#define HIDLOG_LINES    512
+#define HIDLOG_LINE_LEN 160
+#define HIDLOG_NOTIFY_USB_SEEN   1
+#define HIDLOG_NOTIFY_GIP_FOUND  2
+#define HIDLOG_NOTIFY_GIP_READY  4
+static char g_logLines[HIDLOG_LINES][HIDLOG_LINE_LEN];
+static volatile LONG g_logHead = 0;      // total number of lines ever logged
+static LONG g_logFlushed = 0;            // lines already written to the file
+static volatile LONG g_logNotify = 0;    // HIDLOG_NOTIFY_* bits, shown by the flush thread
+
+int HidLogPrint(const char* fmt, ...) {
+	char buf[HIDLOG_LINE_LEN];
+	va_list ap;
+	va_start(ap, fmt);
+	_vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	va_end(ap);
+	buf[sizeof(buf) - 1] = 0;
+	DbgPrint("%s", buf);
+	LONG idx = InterlockedIncrement(&g_logHead) - 1;
+	memcpy(g_logLines[idx % HIDLOG_LINES], buf, HIDLOG_LINE_LEN);
+	return 0;
+}
+
+unsigned int __stdcall LogFlushThreadProc(void* param) {
+	while (true) {
+		Sleep(500);
+		LONG head = g_logHead;
+		if (head != g_logFlushed) {
+			std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
+			if (f.is_open()) {
+				if (head - g_logFlushed > HIDLOG_LINES)
+					g_logFlushed = head - HIDLOG_LINES;   // ring overflowed, skip lost lines
+				for (; g_logFlushed < head; g_logFlushed++)
+					f << g_logLines[g_logFlushed % HIDLOG_LINES];
+			}
+		}
+		LONG n = InterlockedExchange(&g_logNotify, 0);
+		if (n & HIDLOG_NOTIFY_USB_SEEN)  XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: USB device reached HID hook");
+		if (n & HIDLOG_NOTIFY_GIP_FOUND) XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP (Xbox One/Series) pad detected");
+		if (n & HIDLOG_NOTIFY_GIP_READY) XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP pad registered, sent power on");
+	}
+	return 0;
+}
+#define DbgPrint HidLogPrint
+#define HIDLOG_NOTIFY(bit) (g_logNotify |= (bit))
+#else
+#define HIDLOG_NOTIFY(bit) ((void)0)
+#endif
+
 struct UsbTrb {
 	DWORD endpoint;
 	DWORD callback;
@@ -695,6 +753,7 @@ int32_t gipSetConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	}
 
 	GipQueueInitPackets(globalIndex);
+	HIDLOG_NOTIFY(HIDLOG_NOTIFY_GIP_READY);
 
 	return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
 }
@@ -1544,10 +1603,12 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: Interface %d class %02x subclass %02x protocol %02x\n",
 		interface_descriptor->bInterfaceNumber, interface_descriptor->bInterfaceClass,
 		interface_descriptor->bInterfaceSubClass, interface_descriptor->bInterfaceProtocol);
+	HIDLOG_NOTIFY(HIDLOG_NOTIFY_USB_SEEN);
 
 	// Xbox One / Series pads expose three GIP interfaces, the gamepad is interface 0
 	if (IsGipInterface(interface_descriptor) && interface_descriptor->bInterfaceNumber == 0) {
 		DbgPrint("EINTIM: GIP controller detected. Initialising GIP handler.\n");
+		HIDLOG_NOTIFY(HIDLOG_NOTIFY_GIP_FOUND);
 
 		int index = -1;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -1993,6 +2054,10 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 
 		// Start mapping manager thread
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
+#if HIDDRIVER_FILELOG
+		MakeThread((LPTHREAD_START_ROUTINE)LogFlushThreadProc, nullptr);
+		DbgPrint("EINTIM: file log active at HDD:\\hiddriver.log\n");
+#endif
 	}
 	return TRUE;
 }
