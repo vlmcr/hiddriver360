@@ -38,6 +38,11 @@ Tested descriptor of a Series X|S pad (model 1914, `045e:0b12`) is in
 on Windows. Interface 0 (alt 0) is the gamepad with interrupt OUT `0x02` and
 interrupt IN `0x82`, interfaces 1 and 2 are audio and bulk and are ignored.
 
+Host side test: `python tools/gip_host_test/build_and_run.py` compiles the real GIP
+section of `main.cpp` (32 bit, with the kernel stubbed) and runs it against model 1914
+style packets: init sequence, input report, guide button acks, OUT queue ordering,
+rumble and the vendor init table.
+
 Known unknown: the driver hooks the kernel HID class driver's AddDevice. If the
 360 USB stack routes vendor class devices somewhere else, the GIP pad never
 reaches that hook. The hook now logs the class/subclass/protocol of every device
