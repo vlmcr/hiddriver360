@@ -80,6 +80,8 @@ int main() {
 	printf("== OUT endpoint + idle colour ==\n");
 	CHECK(DsOpenOutEndpoint(0) == 0 && c.dsOutBuffer != NULL, "OUT endpoint opened, buffer allocated");
 	DsSetLightbar(0, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
+	CHECK(g_sent.empty() && c.dsLightbarPending == 1, "colour change only marks pending (thread sends)");
+	DsPumpOut(0);
 	CHECK(g_sent.size() == 1 && g_sent[0].data.size() == 48, "one 48 byte report sent");
 	{ std::vector<uint8_t>& d = g_sent[0].data;
 	  CHECK(d[0] == 0x02 && d[2] == 0x04, "report 0x02 with lightbar control flag");
@@ -92,6 +94,8 @@ int main() {
 	CHECK(settle(0, r, 3) == 0 && !c.dsTiltSteering, "flat, mode off: LX untouched (0)");
 	report(r, true, 0, 8192, 0); settle(0, r, 1);
 	CHECK(c.dsTiltSteering, "touchpad press toggles mode on");
+	CHECK(g_sent.size() == 1, "nothing sent from the input callback itself");
+	DsPumpOut(0);
 	CHECK(g_sent.size() == 2 && g_sent[1].data[45] == 255 && g_sent[1].data[46] == 0 && g_sent[1].data[47] == 0, "lightbar red sent");
 	CHECK(g_sent[1].data[39] == 0, "second report has no setup bytes");
 	completeOut();
@@ -121,16 +125,19 @@ int main() {
 	printf("== toggle off restores physical stick ==\n");
 	report(r, true, 5793, 5793, 0); settle(0, r, 1);
 	CHECK(!c.dsTiltSteering, "touchpad press toggles mode off");
+	DsPumpOut(0);
 	CHECK(g_sent.size() == 3 && g_sent[2].data[47] == 255 && g_sent[2].data[45] == 0, "lightbar blue sent");
 	report(r, false, 5793, 5793, 0);
 	{ ButtonsReport b; memset(&b, 0, sizeof b); b.x = 1234; settle(0, r, 30); DsProcessInputReport(0, r, &b); CHECK(b.x == 1234, "mode off: LX from HID mapping preserved"); }
 
 	printf("== busy endpoint: latest colour wins ==\n");
-	DsSetLightbar(0, 1, 2, 3);                      // completion of report 3 not yet signalled -> pending
+	DsSetLightbar(0, 1, 2, 3); DsPumpOut(0);         // report 3 still in flight -> stays pending
 	CHECK(g_sent.size() == 3 && c.dsLightbarPending == 1, "while busy nothing new is sent, colour pending");
 	DsSetLightbar(0, 9, 9, 9);
 	completeOut();
-	CHECK(g_sent.size() == 4 && g_sent[3].data[45] == 9 && g_sent[3].data[47] == 9, "completion sends the latest pending colour once");
+	CHECK(g_sent.size() == 3, "completion itself never sends");
+	DsPumpOut(0);
+	CHECK(g_sent.size() == 4 && g_sent[3].data[45] == 9 && g_sent[3].data[47] == 9, "next pump sends the latest pending colour once");
 	completeOut();
 	CHECK(c.dsOutBusy == 0 && c.dsLightbarPending == 0, "endpoint idle");
 

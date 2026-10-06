@@ -215,6 +215,10 @@ static void HidLogKernelScan() {
 	HidLogPrint("EINTIM: code dumps done\n");
 }
 
+#if HIDDRIVER_DS_TILT
+void DsPumpAllPending();   // defined in the DualSense section, needs connectedControllers
+#endif
+
 unsigned int __stdcall LogFlushThreadProc(void* param) {
 	LONG seenHook = 0, seenFound = 0, seenReady = 0;
 	bool announced = false;
@@ -243,6 +247,9 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 			seenReady = g_statGipReady;
 			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP pad registered, sent power on");
 		}
+#if HIDDRIVER_DS_TILT
+		DsPumpAllPending();
+#endif
 		LONG head = g_logHead;
 		if (head != g_logFlushed) {
 			if (head - g_logFlushed > HIDLOG_LINES)
@@ -258,7 +265,7 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 			if (used)
 				NtAppendText(HIDLOG_NT_PATH, g_logChunk, used);
 		}
-		Sleep(500);
+		Sleep(100);
 	}
 	return 0;
 }
@@ -987,6 +994,7 @@ void DsPumpOut(int index) {
 	r[DS_OUT_LIGHTBAR_R] = ctl.dsLightbar[0];
 	r[DS_OUT_LIGHTBAR_G] = ctl.dsLightbar[1];
 	r[DS_OUT_LIGHTBAR_B] = ctl.dsLightbar[2];
+	DbgPrint("EINTIM: DualSense lightbar %d,%d,%d\n", r[DS_OUT_LIGHTBAR_R], r[DS_OUT_LIGHTBAR_G], r[DS_OUT_LIGHTBAR_B]);
 	SendInterruptRequest(ctl.deviceHandle, &ctl.dsOutTrb, r, DS_OUTPUT_REPORT_SIZE, (DWORD)dsOutCompleteHandler);
 }
 
@@ -997,8 +1005,15 @@ int32_t dsOutCompleteHandler(DWORD trbPtr, int32_t status) {
 	if (status != 0)
 		DbgPrint("EINTIM: DualSense OUT transfer failed with status %x\n", status);
 	InterlockedExchange(&connectedControllers[index].dsOutBusy, 0);
-	DsPumpOut(index);
 	return 0;
+}
+
+// Called from the background thread every 100 ms.
+void DsPumpAllPending() {
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (connectedControllers[i].controllerDriver && connectedControllers[i].dsLightbarPending)
+			DsPumpOut(i);
+	}
 }
 
 void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
@@ -1007,7 +1022,7 @@ void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
 	ctl.dsLightbar[1] = green;
 	ctl.dsLightbar[2] = blue;
 	InterlockedExchange(&ctl.dsLightbarPending, 1);
-	DsPumpOut(index);
+	// sent by DsPumpOut from the background thread, never from USB context
 }
 
 // Opens the interrupt OUT endpoint on the final controller slot, the same way
@@ -1033,6 +1048,7 @@ NTSTATUS DsOpenOutEndpoint(int index) {
 	}
 	ctl.dsOutBuffer = (uint8_t*)malloc(DS_OUTPUT_REPORT_SIZE);
 	memset(ctl.dsOutBuffer, 0, DS_OUTPUT_REPORT_SIZE);
+	DbgPrint("EINTIM: DualSense OUT endpoint %02x opened\n", outDescriptor->bEndpointAddress);
 	return status;
 }
 
