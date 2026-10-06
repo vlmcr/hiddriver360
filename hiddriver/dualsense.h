@@ -36,6 +36,7 @@
 #define DS_TILT_FILTER_SHIFT    2       // exponential smoothing, new sample weight 1/4
 #define DS_TILT_INVERT          0       // 0 = negate roll (left tilt -> stick left), 1 = opposite
 #define DS_TILT_TOGGLE_HOLDOFF  25      // reports to ignore after a toggle (~100 ms), masks switch bounce
+#define DS_TILT_START_DELAY     500     // reports (~2 s) between switching on and applying steering
 
 #define DS_LIGHTBAR_ON_R  255
 #define DS_LIGHTBAR_ON_G  0

@@ -265,7 +265,7 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 			if (used)
 				NtAppendText(HIDLOG_NT_PATH, g_logChunk, used);
 		}
-		Sleep(100);
+		Sleep(20);
 	}
 	return 0;
 }
@@ -530,6 +530,8 @@ struct Controller {
 	bool dsTiltSteering;              // touchpad click toggles this
 	uint8_t dsTouchpadPrev;           // last touchpad click bit, for edge detection
 	uint16_t dsToggleHoldoff;         // reports left to ignore after a toggle
+	uint16_t dsSteerDelay;            // reports to wait after switching on before steering is applied
+	uint16_t dsTraceCounter;          // throttles the per-report trace line
 	int32_t dsSteerFiltered;          // smoothed steering value
 	UsbTrb dsOutTrb;                  // interrupt OUT endpoint for the lightbar report
 	uint8_t* dsOutBuffer;             // 48 byte output report in flight
@@ -1002,8 +1004,7 @@ int32_t dsOutCompleteHandler(DWORD trbPtr, int32_t status) {
 	int index = DsFindControllerByOutTrb((void*)trbPtr);
 	if (index < 0)
 		return 0;
-	if (status != 0)
-		DbgPrint("EINTIM: DualSense OUT transfer failed with status %x\n", status);
+	DbgPrint("EINTIM: DualSense OUT complete, status %x\n", status);
 	InterlockedExchange(&connectedControllers[index].dsOutBusy, 0);
 	return 0;
 }
@@ -1118,6 +1119,8 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 		ctl.dsTiltSteering = !ctl.dsTiltSteering;
 		ctl.dsSteerFiltered = 0;
 		ctl.dsToggleHoldoff = DS_TILT_TOGGLE_HOLDOFF;
+		ctl.dsSteerDelay = DS_TILT_START_DELAY;
+		ctl.dsTraceCounter = 0;
 		DbgPrint("EINTIM: DualSense tilt steering %s\n", ctl.dsTiltSteering ? "ON" : "OFF");
 		if (ctl.dsTiltSteering)
 			DsSetLightbar(index, DS_LIGHTBAR_ON_R, DS_LIGHTBAR_ON_G, DS_LIGHTBAR_ON_B);
@@ -1127,10 +1130,19 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 	ctl.dsTouchpadPrev = touch;
 
 	if (ctl.dsTiltSteering) {
-		out->x = DsRollToSteer(ctl,
-			ds_s16(report + DS_IN_ACCEL_X),
-			ds_s16(report + DS_IN_ACCEL_Y),
-			ds_s16(report + DS_IN_ACCEL_Z));
+		if (ctl.dsSteerDelay > 0) {
+			// grace period after switching on: lightbar first, steering later
+			ctl.dsSteerDelay--;
+			if (ctl.dsSteerDelay == 0)
+				DbgPrint("EINTIM: DualSense steering active\n");
+			return;
+		}
+		int32_t ax = ds_s16(report + DS_IN_ACCEL_X);
+		int32_t ay = ds_s16(report + DS_IN_ACCEL_Y);
+		int32_t az = ds_s16(report + DS_IN_ACCEL_Z);
+		out->x = DsRollToSteer(ctl, ax, ay, az);
+		if ((++ctl.dsTraceCounter & 15) == 0)
+			DbgPrint("EINTIM: tilt ax=%d ay=%d az=%d lx=%d\n", ax, ay, az, (int32_t)out->x);
 	}
 }
 #endif

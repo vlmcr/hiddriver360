@@ -35,7 +35,7 @@ struct Controller {
 	HidControllerExtension* controllerDriver;
 	ButtonsReport currentState;
 	uint16_t vendorId, productId;
-	bool dsTiltSteering; uint8_t dsTouchpadPrev; uint16_t dsToggleHoldoff; int32_t dsSteerFiltered;
+	bool dsTiltSteering; uint8_t dsTouchpadPrev; uint16_t dsToggleHoldoff; uint16_t dsSteerDelay; uint16_t dsTraceCounter; int32_t dsSteerFiltered;
 	UsbTrb dsOutTrb; uint8_t* dsOutBuffer; volatile LONG dsOutBusy; volatile LONG dsLightbarPending;
 	uint8_t dsLightbar[3]; bool dsLightbarSetupSent;
 };
@@ -62,6 +62,7 @@ static void report(uint8_t* r, bool touch, int16_t ax, int16_t ay, int16_t az) {
 	r[22] = ax & 0xFF; r[23] = (ax >> 8) & 0xFF; r[24] = ay & 0xFF; r[25] = (ay >> 8) & 0xFF; r[26] = az & 0xFF; r[27] = (az >> 8) & 0xFF;
 }
 static int16_t settle(int idx, uint8_t* r, int n) { ButtonsReport b; for (int i = 0; i < n; i++) { memset(&b, 0, sizeof b); DsProcessInputReport(idx, r, &b); } return b.x; }
+static void skipDelay(int idx, uint8_t* r) { connectedControllers[idx].dsSteerDelay = 0; (void)r; }
 
 int main() {
 	deviceHandle dev; HidControllerExtension ext; dev.driver = &ext;
@@ -106,6 +107,7 @@ int main() {
 	CHECK(c.dsTiltSteering, "second press inside the hold-off window is ignored (bounce)");
 	report(r, false, 0, 8192, 0); settle(0, r, 30);
 
+	skipDelay(0, r);
 	report(r, false, 5793, 5793, 0);               // 45 degrees, tilt so ax is positive
 	int16_t lx = settle(0, r, 40);
 	CHECK(lx == -32767, "45 degree roll with positive ax = full stick LEFT (-32767)");
