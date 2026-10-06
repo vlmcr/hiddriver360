@@ -62,6 +62,47 @@ static volatile LONG g_statHookCalls = 0;   // HidAddDeviceHook entered
 static volatile LONG g_statGipFound = 0;    // GIP interface matched
 static volatile LONG g_statGipReady = 0;    // GIP pad registered, power on queued
 
+// Append text to a file by absolute NT device path, e.g.
+// \\Device\\Harddisk0\\Partition1\\hiddriver.log. Independent of the HDD: symbolic
+// link, so it works no matter how early the plugin runs. Kernel exports are
+// resolved by ordinal in initFunctionPointers like the Usbd ones.
+typedef NTSTATUS(*nt_create_file_func_t)(HANDLE* FileHandle, ACCESS_MASK DesiredAccess, OBJECT_ATTRIBUTES* ObjectAttributes,
+	IO_STATUS_BLOCK* IoStatusBlock, LARGE_INTEGER* AllocationSize, DWORD FileAttributes, DWORD ShareAccess,
+	DWORD CreateDisposition, DWORD CreateOptions);
+typedef NTSTATUS(*nt_write_file_func_t)(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext,
+	IO_STATUS_BLOCK* IoStatusBlock, PVOID Buffer, DWORD Length, LARGE_INTEGER* ByteOffset);
+typedef NTSTATUS(*nt_close_func_t)(HANDLE Handle);
+static nt_create_file_func_t pNtCreateFile = nullptr;
+static nt_write_file_func_t pNtWriteFile = nullptr;
+static nt_close_func_t pNtClose = nullptr;
+#define HIDLOG_NT_PATH "\\Device\\Harddisk0\\Partition1\\hiddriver.log"
+#define HIDLOG_NT_MARKER "\\Device\\Harddisk0\\Partition1\\hiddriver_boot.txt"
+
+static NTSTATUS NtAppendText(const char* ntPath, const char* text, size_t length) {
+	if (!pNtCreateFile || !pNtWriteFile || !pNtClose)
+		return -1;
+	STRING name;
+	name.Length = (USHORT)strlen(ntPath);
+	name.MaximumLength = name.Length + 1;
+	name.Buffer = (PCHAR)ntPath;
+	OBJECT_ATTRIBUTES oa;
+	oa.RootDirectory = NULL;
+	oa.ObjectName = &name;
+	oa.Attributes = 0x40; // OBJ_CASE_INSENSITIVE
+	IO_STATUS_BLOCK iosb;
+	HANDLE h = NULL;
+	// FILE_APPEND_DATA | SYNCHRONIZE, FILE_OPEN_IF, synchronous non-directory
+	NTSTATUS st = pNtCreateFile(&h, 0x00000004 | 0x00100000, &oa, &iosb, NULL, 0x80 /*NORMAL*/,
+		0x3 /*share read|write*/, 3 /*FILE_OPEN_IF*/, 0x20 | 0x40 /*SYNCHRONOUS_IO_NONALERT | NON_DIRECTORY*/);
+	if (st < 0)
+		return st;
+	LARGE_INTEGER offset;
+	offset.QuadPart = -1; // FILE_WRITE_TO_END_OF_FILE
+	st = pNtWriteFile(h, NULL, NULL, NULL, &iosb, (PVOID)text, (DWORD)length, &offset);
+	pNtClose(h);
+	return st;
+}
+
 // Minimal printf: %d %u %x %X %p %s %c %% with optional 0-padding width.
 // Used instead of the CRT so logging is safe from USB completion context.
 static void HidLogFormat(char* out, size_t cap, const char* fmt, va_list ap) {
@@ -121,11 +162,20 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 	bool announced = false;
 	while (true) {
 		if (!announced) {
-			std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
-			if (f.is_open()) {
-				f << "=== hiddriver log start, build " << __DATE__ << " " << __TIME__ << " ===" << std::endl;
+			const char* start = "=== hiddriver log start, build " __DATE__ " " __TIME__ " ===\r\n";
+			NTSTATUS st = NtAppendText(HIDLOG_NT_PATH, start, strlen(start));
+			if (st >= 0) {
 				announced = true;
 				HidLogStatus("flush thread up");
+			}
+			else {
+				std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
+				if (f.is_open()) {
+					f << start;
+					announced = true;
+					HidLogPrint("EINTIM: NT path log open failed %x, using HDD: path\n", st);
+					HidLogStatus("flush thread up");
+				}
 			}
 		}
 		if (g_statHookCalls != seenHook) {
@@ -143,12 +193,23 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 		}
 		LONG head = g_logHead;
 		if (head != g_logFlushed) {
-			std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
-			if (f.is_open()) {
-				if (head - g_logFlushed > HIDLOG_LINES)
-					g_logFlushed = head - HIDLOG_LINES;   // ring overflowed, skip lost lines
-				for (; g_logFlushed < head; g_logFlushed++)
-					f << g_logLines[g_logFlushed % HIDLOG_LINES];
+			if (head - g_logFlushed > HIDLOG_LINES)
+				g_logFlushed = head - HIDLOG_LINES;   // ring overflowed, skip lost lines
+			char chunk[HIDLOG_LINES * HIDLOG_LINE_LEN / 8];
+			size_t used = 0;
+			for (; g_logFlushed < head; g_logFlushed++) {
+				const char* line = g_logLines[g_logFlushed % HIDLOG_LINES];
+				size_t len = strlen(line);
+				if (used + len >= sizeof(chunk)) break;
+				memcpy(chunk + used, line, len);
+				used += len;
+			}
+			if (used) {
+				if (NtAppendText(HIDLOG_NT_PATH, chunk, used) < 0) {
+					std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
+					if (f.is_open())
+						f.write(chunk, used);
+				}
 			}
 		}
 		Sleep(500);
@@ -2003,6 +2064,11 @@ bool initFunctionPointers() {
 	XexGetProcedureAddress(kernelHandle, 751, &UsbdRemoveDeviceComplete);
 	XexGetProcedureAddress(kernelHandle, 189, &MmFreePhysicalMemory);
 	XexGetProcedureAddress(kernelHandle, 486, &XInputdReadStatePtr);
+#if HIDDRIVER_FILELOG
+	XexGetProcedureAddress(kernelHandle, 210, &pNtCreateFile);
+	XexGetProcedureAddress(kernelHandle, 255, &pNtWriteFile);
+	XexGetProcedureAddress(kernelHandle, 207, &pNtClose);
+#endif
 
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
 	XexGetProcedureAddress(xamHandle, 402, &XamInputSetState);
@@ -2085,10 +2151,13 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		{
 			// Written synchronously while still inside DllMain: proves the plugin
 			// loaded and that HDD: is reachable at plugin load time.
+			const char* text = "hiddriver loaded, build " __DATE__ " " __TIME__ "\r\n";
+			NTSTATUS st = NtAppendText(HIDLOG_NT_MARKER, text, strlen(text));
 			std::ofstream marker("HDD:\\hiddriver_boot.txt", std::ios::app);
 			if (marker.is_open())
-				marker << "hiddriver loaded, build " << __DATE__ << " " << __TIME__ << " kernel " << XboxKrnlVersion->Build << std::endl;
-			DbgPrint("EINTIM: boot marker %s\n", marker.is_open() ? "written" : "FAILED (HDD: not reachable yet)");
+				marker << "hiddriver loaded via HDD: path, build " << __DATE__ << " " << __TIME__ << std::endl;
+			DbgPrint("EINTIM: boot marker NT path status %x, HDD: path %s\n", st, marker.is_open() ? "ok" : "FAILED");
+			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver loaded (GIP build)");
 		}
 #endif
 
