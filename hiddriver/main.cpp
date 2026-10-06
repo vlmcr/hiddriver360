@@ -11,6 +11,7 @@
 #include "hid_parser.h"  
 #include "usb.h"
 #include "mapping.h"
+#include "dualsense.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -278,7 +279,31 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+
+	// DualSense tilt steering state, unused for other pads
+	bool dsTiltSteering;              // touchpad click toggles this
+	uint8_t dsTouchpadPrev;           // last touchpad click bit, for edge detection
+	uint16_t dsToggleHoldoff;         // reports left to ignore after a toggle
+	int32_t dsSteerFiltered;          // smoothed steering value
+	bool dsOutOpened;                 // OUT endpoint opened (lazily, from the input callback)
+	bool dsOutFailed;                 // opening failed, lightbar disabled for this pad
+	uint16_t dsReportsSinceSend;      // input reports seen since the last lightbar write
+	volatile LONG dsLightbarPending;
+	uint8_t dsLightbar[3];
+	bool dsLightbarSetupSent;
+	uint8_t dsOutReport[DS_OUTPUT_BUFFER_SIZE];   // output report handed to the kernel, inline on purpose
+	// The OUT transfer block MUST stay the last member. UsbTrb is reverse engineered
+	// and the kernel writes past its 28 bytes; the guard absorbs that instead of
+	// whatever field would otherwise follow (a pointer here crashed the console).
+	UsbTrb dsOutTrb;
+	BYTE dsOutTrbGuard[64];
 } __declspec(align(4));
+
+// Atomics on PowerPC fault on misaligned addresses, and the OUT TRB layout matters: pin both.
+static_assert(offsetof(Controller, dsLightbarPending) % 4 == 0, "dsLightbarPending misaligned");
+static_assert(offsetof(Controller, dsOutTrb) % 4 == 0, "dsOutTrb misaligned");
+static_assert(offsetof(Controller, dsOutTrbGuard) == offsetof(Controller, dsOutTrb) + sizeof(UsbTrb), "guard must follow the OUT TRB");
+static_assert(offsetof(Controller, dsOutTrbGuard) + 64 == sizeof(Controller), "OUT TRB + guard must end the Controller");
 
 struct MappingState {
 	volatile bool active;
@@ -392,6 +417,193 @@ void SendInterruptRequest(
 int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
+
+// ---- DualSense specific start ----
+//
+// Tilt steering: clicking the touchpad toggles a mode where the roll angle of
+// the pad (held like a steering wheel) replaces the left stick X axis. The
+// lightbar shows the state: red = on, blue = off. Integer math only, this runs
+// from the USB completion callback.
+#if HIDDRIVER_DS_TILT
+
+bool IsDualSense(uint16_t vid, uint16_t pid) {
+	return vid == SONY_VENDOR_ID && (pid == DS_PID_DUALSENSE || pid == DS_PID_DUALSENSE_EDGE);
+}
+
+static inline int16_t ds_s16(const uint8_t* p) {
+	return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+// Lightbar writes follow the Switch Pro pattern that is proven on hardware:
+// the interrupt OUT endpoint is opened lazily from the input callback and the
+// report is queued from that same callback with a no-op completion. Writes are
+// spaced by DS_LIGHTBAR_MIN_SPACING input reports so a transfer is always
+// finished before the TRB is reused; no completion handler is needed.
+
+// Build and queue the pending lightbar report. USB callback context only.
+void DsPumpOut(int index) {
+	Controller& ctl = connectedControllers[index];
+	if (!ctl.controllerDriver || !ctl.dsOutOpened || ctl.dsOutFailed || !ctl.dsLightbarPending)
+		return;
+	if (ctl.dsReportsSinceSend < DS_LIGHTBAR_MIN_SPACING)
+		return;
+	InterlockedExchange(&ctl.dsLightbarPending, 0);
+	ctl.dsReportsSinceSend = 0;
+
+	uint8_t* r = ctl.dsOutReport;
+	memset(r, 0, DS_OUTPUT_BUFFER_SIZE);
+	r[0] = DS_OUTPUT_REPORT_USB;
+	r[DS_OUT_VALID_FLAG1] = DS_FLAG1_LIGHTBAR_CONTROL;
+	if (!ctl.dsLightbarSetupSent) {
+		r[DS_OUT_VALID_FLAG2] = DS_FLAG2_LIGHTBAR_SETUP_CONTROL;
+		r[DS_OUT_LIGHTBAR_SETUP] = DS_LIGHTBAR_SETUP_LIGHT_OUT;
+		ctl.dsLightbarSetupSent = true;
+	}
+	r[DS_OUT_LIGHTBAR_R] = ctl.dsLightbar[0];
+	r[DS_OUT_LIGHTBAR_G] = ctl.dsLightbar[1];
+	r[DS_OUT_LIGHTBAR_B] = ctl.dsLightbar[2];
+	DbgPrint("EINTIM: DualSense lightbar %d,%d,%d\n", r[DS_OUT_LIGHTBAR_R], r[DS_OUT_LIGHTBAR_G], r[DS_OUT_LIGHTBAR_B]);
+	SendInterruptRequest(ctl.deviceHandle, &ctl.dsOutTrb, r, DS_OUTPUT_REPORT_SIZE, (DWORD)noopCompleteHandler);
+}
+
+void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
+	Controller& ctl = connectedControllers[index];
+	ctl.dsLightbar[0] = red;
+	ctl.dsLightbar[1] = green;
+	ctl.dsLightbar[2] = blue;
+#if HIDDRIVER_DS_LIGHTBAR
+	InterlockedExchange(&ctl.dsLightbarPending, 1);
+	// queued by DsPumpOut from the input callback once the spacing allows
+#endif
+}
+
+// Opens the interrupt OUT endpoint exactly like the Switch Pro path does, from
+// the input callback on the final controller slot. On failure the lightbar is
+// simply never updated; input keeps working.
+void DsOpenOutEndpoint(int index) {
+	Controller& ctl = connectedControllers[index];
+	ctl.dsOutOpened = true;   // only one attempt
+	usb_endpoint_descriptor* outDescriptor = UsbdGetEndpointDescriptor(
+		ctl.deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+	if (!outDescriptor) {
+		DbgPrint("EINTIM: DualSense has no interrupt OUT endpoint\n");
+		ctl.dsOutFailed = true;
+		return;
+	}
+	NTSTATUS status = UsbdOpenEndpoint(
+		ctl.deviceHandle,
+		3,
+		outDescriptor->bEndpointAddress,
+		swap_endianness_16(outDescriptor->wMaxPacketSize) & 0x7FF,
+		outDescriptor->bInterval,
+		(DWORD*)&ctl.dsOutTrb);
+	if (NT_ERROR(status)) {
+		DbgPrint("EINTIM: Failed to open DualSense OUT endpoint %x\n", status);
+		ctl.dsOutFailed = true;
+		return;
+	}
+	memset(ctl.dsOutReport, 0, DS_OUTPUT_BUFFER_SIZE);
+	ctl.dsReportsSinceSend = DS_LIGHTBAR_MIN_SPACING;   // first write may go out at once
+	DbgPrint("EINTIM: DualSense OUT endpoint %02x opened\n", outDescriptor->bEndpointAddress);
+}
+
+uint32_t DsIsqrt32(uint32_t v) {
+	uint32_t result = 0;
+	uint32_t bit = 1u << 30;
+	while (bit > v) bit >>= 2;
+	while (bit != 0) {
+		if (v >= result + bit) { v -= result + bit; result = (result >> 1) + bit; }
+		else result >>= 1;
+		bit >>= 2;
+	}
+	return result;
+}
+
+// atan2 in tenths of a degree for x >= 0, result -900..900.
+int32_t DsAtan2Deg10(int32_t y, int32_t x) {
+	int32_t ay = y < 0 ? -y : y;
+	if (x <= 0 && ay == 0) return 0;
+	int32_t angle;
+	if (ay <= x)
+		angle = ds_atan_table[(ay * 64) / x];
+	else
+		angle = 900 - ds_atan_table[(x * 64) / ay];
+	return y < 0 ? -angle : angle;
+}
+
+// Roll of the pad from the gravity vector, mapped onto a stick axis.
+int16_t DsRollToSteer(Controller& ctl, int32_t ax, int32_t ay, int32_t az) {
+	uint32_t horizontal = DsIsqrt32((uint32_t)((int64_t)ay * ay + (int64_t)az * az));
+	int32_t roll10 = DsAtan2Deg10(ax, (int32_t)horizontal);
+
+	int32_t magnitude = roll10 < 0 ? -roll10 : roll10;
+	int32_t steer = 0;
+	if (magnitude > DS_TILT_DEADZONE_DEG10) {
+		magnitude -= DS_TILT_DEADZONE_DEG10;
+		steer = magnitude * 32767 / (DS_TILT_MAX_DEG10 - DS_TILT_DEADZONE_DEG10);
+		if (steer > 32767) steer = 32767;
+		if (roll10 < 0) steer = -steer;
+	}
+	// tilting left raises the right handle, ax goes positive, XInput left is negative
+#if !DS_TILT_INVERT
+	steer = -steer;
+#endif
+
+	int32_t delta = steer - ctl.dsSteerFiltered;
+	if (delta > -(1 << DS_TILT_FILTER_SHIFT) && delta < (1 << DS_TILT_FILTER_SHIFT))
+		ctl.dsSteerFiltered = steer;      // snap the last few units so both ends reach full lock
+	else
+		ctl.dsSteerFiltered += delta >> DS_TILT_FILTER_SHIFT;
+	if (ctl.dsSteerFiltered > 32767) ctl.dsSteerFiltered = 32767;
+	if (ctl.dsSteerFiltered < -32767) ctl.dsSteerFiltered = -32767;
+	return (int16_t)ctl.dsSteerFiltered;
+}
+
+// Called for every USB input report of a DualSense, after the HID mapping has
+// filled `out`. `report` includes the report ID byte.
+void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) {
+	Controller& ctl = connectedControllers[index];
+	if (report[0] != DS_INPUT_REPORT_USB)
+		return;
+
+#if HIDDRIVER_DS_LIGHTBAR
+	if (!ctl.dsOutOpened) {
+		DsOpenOutEndpoint(index);
+		if (!ctl.dsOutFailed)
+			DsSetLightbar(index, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
+	}
+	if (ctl.dsReportsSinceSend < 0xFFFF)
+		ctl.dsReportsSinceSend++;
+#endif
+
+	uint8_t touch = (report[DS_IN_BUTTONS2] & DS_BTN2_TOUCHPAD) ? 1 : 0;
+	if (ctl.dsToggleHoldoff > 0)
+		ctl.dsToggleHoldoff--;
+	else if (touch && !ctl.dsTouchpadPrev) {
+		ctl.dsTiltSteering = !ctl.dsTiltSteering;
+		ctl.dsSteerFiltered = 0;
+		ctl.dsToggleHoldoff = DS_TILT_TOGGLE_HOLDOFF;
+		DbgPrint("EINTIM: DualSense tilt steering %s\n", ctl.dsTiltSteering ? "ON" : "OFF");
+		if (ctl.dsTiltSteering)
+			DsSetLightbar(index, DS_LIGHTBAR_ON_R, DS_LIGHTBAR_ON_G, DS_LIGHTBAR_ON_B);
+		else
+			DsSetLightbar(index, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
+	}
+	ctl.dsTouchpadPrev = touch;
+
+	if (ctl.dsTiltSteering) {
+		out->x = DsRollToSteer(ctl,
+			ds_s16(report + DS_IN_ACCEL_X),
+			ds_s16(report + DS_IN_ACCEL_Y),
+			ds_s16(report + DS_IN_ACCEL_Z));
+	}
+
+#if HIDDRIVER_DS_LIGHTBAR
+	DsPumpOut(index);
+#endif
+}
+#endif
+// ---- DualSense specific end ----
 
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
@@ -1001,6 +1213,9 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 		}
 	}
 
+	if (index < 0) // report for a slot we no longer track, keep the pipe alive
+		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
+
 	if (NeedsNintendoHandshake(connectedControllers[index].vendorId, connectedControllers[index].productId) && connectedControllers[index].nintendo_handshake_state != DONE) {
 		if (connectedControllers[index].nintendo_handshake_state == INITIAL) {
 			DbgPrint("EINTIM: Gotta do nintendo handshake for this one!\r\n");
@@ -1103,6 +1318,10 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 				&buttonReport,
 				connectedControllers[index].reportId,
 				connectedControllers[index].map);
+#if HIDDRIVER_DS_TILT
+			if (hasReportId && IsDualSense(connectedControllers[index].vendorId, connectedControllers[index].productId))
+				DsProcessInputReport(index, (const uint8_t*)report, &buttonReport);
+#endif
 		}
 		else if (g_mappingState.active && g_mappingState.controllerIndex == index) {
 			// Collect raw button states during mapping - only check discovered buttons

@@ -16,6 +16,7 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - DualShock 4 Wireless Adapter (CUH-ZWA1E)
 - DualSense (PS5 controller)
 - DualSense Edge
+- DualSense / DualSense Edge optional tilt steering, Gran Turismo style (touchpad click toggles it, lightbar red/blue) — see [DUALSENSE_GYRO.md](DUALSENSE_GYRO.md)
 - DualShock 3
 - Nintendo Switch Pro controller
 - Any USB HID compliant controller thanks to built in mapping assistant :) (this excludes modern xbox controllers like xbox one and xbox series because microsoft made them GIP only)

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DualSense Tilt Steering</title>
+<meta name="description" content="Live preview of hiddriver360's tilt steering mode: rotate a USB DualSense and watch the computed left stick.">
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5c6670; --line: #d9dee5;
+    --accent: #2b6cb0; --phys: #7a8696; --on: #d53f3f; --off: #2b6cb0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171b; --panel: #1d2127; --text: #e6e9ee; --muted: #9aa5b1; --line: #313844;
+      --accent: #5aa0e6; --phys: #8b96a5; --on: #ef5a5a; --off: #5aa0e6;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171b; --panel: #1d2127; --text: #e6e9ee; --muted: #9aa5b1; --line: #313844;
+    --accent: #5aa0e6; --phys: #8b96a5; --on: #ef5a5a; --off: #5aa0e6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; flex: 1 1 260px; }
+  button { font: inherit; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { margin-top: 10px; color: var(--muted); min-height: 1.5em; }
+  .mode { display: inline-block; padding: 6px 12px; border-radius: 999px; font-weight: 600; color: #fff; background: var(--off); }
+  .mode.on { background: var(--on); }
+  canvas { width: 100%; max-width: 320px; aspect-ratio: 1; display: block; margin: 8px auto; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  label { display: block; margin-top: 12px; }
+  input[type=range] { width: 100%; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; font-size: 13px; }
+  .legend span { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .warn { color: var(--on); }
+</style>
+</head>
+<body>
+<main>
+  <h1>DualSense tilt steering preview</h1>
+  <p class="sub">Same integer math as the hiddriver360 build. Plug the pad in with a USB cable, connect, click the touchpad to toggle, rotate the pad like a wheel.</p>
+
+  <div class="row">
+    <section class="panel">
+      <button id="connect">Connect DualSense</button>
+      <div class="status" id="status">Needs Chrome or Edge with WebHID. Close DS4Windows or similar tools first.</div>
+      <p>Mode: <span class="mode" id="mode">OFF</span></p>
+      <div class="legend">
+        <span style="background: var(--phys)"></span>physical left stick &nbsp;
+        <span style="background: var(--on)"></span>what the Xbox would get
+      </div>
+      <canvas id="stick" width="320" height="320"></canvas>
+    </section>
+
+    <section class="panel">
+      <table>
+        <tr><td>accel X / Y / Z</td><td id="acc">–</td></tr>
+        <tr><td>roll (degrees)</td><td id="roll">–</td></tr>
+        <tr><td>computed LX</td><td id="lx">–</td></tr>
+        <tr><td>computed LX (%)</td><td id="lxpct">–</td></tr>
+        <tr><td>physical LX / LY</td><td id="phys">–</td></tr>
+        <tr><td>touchpad click</td><td id="touch">–</td></tr>
+        <tr><td>reports / s</td><td id="rate">–</td></tr>
+      </table>
+
+      <label>Full lock angle: <b id="maxv">45</b>°
+        <input type="range" id="max" min="15" max="90" value="45"></label>
+      <label>Dead zone: <b id="dzv">3</b>°
+        <input type="range" id="dz" min="0" max="15" value="3"></label>
+      <label>Smoothing shift: <b id="fsv">2</b>
+        <input type="range" id="fs" min="0" max="4" value="2"></label>
+      <label><input type="checkbox" id="inv"> Invert steering direction</label>
+
+      <p>Constants for <code>hiddriver/dualsense.h</code>:</p>
+      <pre id="consts"></pre>
+    </section>
+  </div>
+</main>
+
+<script>
+(() => {
+  // ---- constants mirrored from dualsense.h ----
+  const VID = 0x054C, PIDS = [0x0CE6, 0x0DF2];
+  const IN_REPORT = 0x01, IN_BUTTONS2 = 10, BTN2_TOUCH = 1 << 1;
+  const IN_ACCEL_X = 22, IN_ACCEL_Y = 24, IN_ACCEL_Z = 26;
+  const OUT_REPORT = 0x02, OUT_SIZE = 63, OUT_FLAG1 = 2, FLAG1_LIGHTBAR = 0x04; // 63 = full USB output report
+  const OUT_FLAG2 = 39, FLAG2_SETUP = 0x02, OUT_SETUP = 42, SETUP_LIGHT_OUT = 0x02;
+  const OUT_R = 45, OUT_G = 46, OUT_B = 47;
+  const ATAN = [0,9,18,27,36,45,54,62,71,80,89,98,106,115,123,132,140,149,157,165,174,182,190,198,
+    206,213,221,229,236,244,251,258,266,273,280,287,294,300,307,314,320,326,333,339,345,
+    351,357,363,369,374,380,386,391,396,402,407,412,417,422,427,432,436,441,445,450];
+
+  const HOLDOFF = 25; // reports to ignore after a toggle, same as DS_TILT_TOGGLE_HOLDOFF
+  const tune = { max10: 450, dz10: 30, shift: 2, invert: 0 };
+  const state = { on: false, touchPrev: 0, holdoff: 0, filtered: 0, setupSent: false, device: null, count: 0, lastTick: performance.now() };
+
+  // ---- same integer routines as the driver ----
+  function isqrt32(v) {
+    let result = 0, bit = 1 << 30;
+    v = v >>> 0;
+    while (bit > v) bit >>>= 2;
+    while (bit !== 0) {
+      if (v >= result + bit) { v -= result + bit; result = (result >>> 1) + bit; }
+      else result >>>= 1;
+      bit >>>= 2;
+    }
+    return result;
+  }
+  function atan2deg10(y, x) {
+    const ay = y < 0 ? -y : y;
+    if (x <= 0 && ay === 0) return 0;
+    let angle;
+    if (ay <= x) angle = ATAN[Math.trunc((ay * 64) / x)];
+    else angle = 900 - ATAN[Math.trunc((x * 64) / ay)];
+    return y < 0 ? -angle : angle;
+  }
+  function rollToSteer(ax, ay, az) {
+    const horizontal = isqrt32((ay * ay + az * az) >>> 0);
+    const roll10 = atan2deg10(ax, horizontal);
+    let magnitude = Math.abs(roll10), steer = 0;
+    const span = Math.max(10, tune.max10 - tune.dz10); // never divide by zero if the sliders cross
+    if (magnitude > tune.dz10) {
+      magnitude -= tune.dz10;
+      steer = Math.trunc(magnitude * 32767 / span);
+      if (steer > 32767) steer = 32767;
+      if (roll10 < 0) steer = -steer;
+    }
+    if (!tune.invert) steer = -steer;
+    const delta = steer - state.filtered;
+    if (delta > -(1 << tune.shift) && delta < (1 << tune.shift)) state.filtered = steer;
+    else state.filtered += delta >> tune.shift;
+    state.filtered = Math.max(-32767, Math.min(32767, state.filtered));
+    return { roll10, lx: state.filtered };
+  }
+
+  // ---- UI ----
+  const $ = id => document.getElementById(id);
+  const canvas = $('stick'), ctx = canvas.getContext('2d');
+  function draw(physX, physY, lx, on) {
+    const w = canvas.width, h = canvas.height, c = w / 2, r = w / 2 - 12;
+    ctx.clearRect(0, 0, w, h);
+    const css = getComputedStyle(document.documentElement);
+    ctx.strokeStyle = css.getPropertyValue('--line'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(c, c, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(c - r, c); ctx.lineTo(c + r, c); ctx.moveTo(c, c - r); ctx.lineTo(c, c + r); ctx.stroke();
+    const px = c + physX / 32767 * r, py = c - physY / 32767 * r;
+    ctx.fillStyle = css.getPropertyValue('--phys');
+    ctx.beginPath(); ctx.arc(px, py, 9, 0, Math.PI * 2); ctx.fill();
+    const ox = c + (on ? lx : physX) / 32767 * r;
+    ctx.fillStyle = css.getPropertyValue(on ? '--on' : '--off');
+    ctx.beginPath(); ctx.arc(ox, py, 12, 0, Math.PI * 2); ctx.fill();
+  }
+  function setMode(on) {
+    state.on = on; state.filtered = 0;
+    $('mode').textContent = on ? 'ON  (tilt drives LX)' : 'OFF (physical stick)';
+    $('mode').classList.toggle('on', on);
+  }
+  function updateConsts() {
+    $('consts').textContent =
+      `#define DS_TILT_MAX_DEG10       ${tune.max10}\n#define DS_TILT_DEADZONE_DEG10  ${tune.dz10}\n#define DS_TILT_FILTER_SHIFT    ${tune.shift}\n#define DS_TILT_INVERT          ${tune.invert}`;
+  }
+  $('max').oninput = e => { tune.max10 = e.target.value * 10; $('maxv').textContent = e.target.value; updateConsts(); };
+  $('dz').oninput = e => { tune.dz10 = e.target.value * 10; $('dzv').textContent = e.target.value; updateConsts(); };
+  $('fs').oninput = e => { tune.shift = +e.target.value; $('fsv').textContent = e.target.value; updateConsts(); };
+  $('inv').onchange = e => { tune.invert = e.target.checked ? 1 : 0; updateConsts(); };
+  updateConsts();
+  setMode(false);
+  draw(0, 0, 0, false);
+
+  // ---- lightbar, same output report as the driver ----
+  async function setLightbar(r, g, b) {
+    if (!state.device) return;
+    const data = new Uint8Array(OUT_SIZE - 1); // report ID is passed separately
+    data[OUT_FLAG1 - 1] = FLAG1_LIGHTBAR;
+    if (!state.setupSent) { data[OUT_FLAG2 - 1] = FLAG2_SETUP; data[OUT_SETUP - 1] = SETUP_LIGHT_OUT; state.setupSent = true; }
+    data[OUT_R - 1] = r; data[OUT_G - 1] = g; data[OUT_B - 1] = b;
+    try { await state.device.sendReport(OUT_REPORT, data); }
+    catch (e) { $('status').textContent = 'lightbar write failed: ' + e.message; }
+  }
+
+  function onReport(e) {
+    if (e.reportId !== IN_REPORT) {
+      $('status').innerHTML = '<span class="warn">Report 0x' + e.reportId.toString(16) + ' received. Use a USB cable, not Bluetooth.</span>';
+      return;
+    }
+    const d = e.data; // DataView without the report ID byte, so driver offsets minus 1
+    const u8 = o => d.getUint8(o - 1), s16 = o => d.getInt16(o - 1, true);
+    const physX = Math.round((u8(1) - 128) * 32767 / 127), physY = Math.round((127 - u8(2)) * 32767 / 127);
+    const touch = (u8(IN_BUTTONS2) & BTN2_TOUCH) ? 1 : 0;
+    if (state.holdoff > 0) state.holdoff--;
+    else if (touch && !state.touchPrev) { setMode(!state.on); state.holdoff = HOLDOFF; state.on ? setLightbar(255, 0, 0) : setLightbar(0, 0, 255); }
+    state.touchPrev = touch;
+    const ax = s16(IN_ACCEL_X), ay = s16(IN_ACCEL_Y), az = s16(IN_ACCEL_Z);
+    const r = rollToSteer(ax, ay, az);
+    const lx = state.on ? r.lx : physX;
+
+    $('acc').textContent = `${ax} / ${ay} / ${az}`;
+    $('roll').textContent = (r.roll10 / 10).toFixed(1);
+    $('lx').textContent = lx;
+    $('lxpct').textContent = (lx / 32767 * 100).toFixed(0) + ' %';
+    $('phys').textContent = `${physX} / ${physY}`;
+    $('touch').textContent = touch ? 'pressed' : '–';
+    state.count++;
+    const now = performance.now();
+    if (now - state.lastTick > 1000) { $('rate').textContent = state.count; state.count = 0; state.lastTick = now; }
+    draw(physX, physY, r.lx, state.on);
+  }
+
+  $('connect').onclick = async () => {
+    if (!navigator.hid) { $('status').innerHTML = '<span class="warn">WebHID not available. Use Chrome or Edge over http://localhost or https.</span>'; return; }
+    try {
+      const filters = PIDS.map(productId => ({ vendorId: VID, productId }));
+      const [device] = await navigator.hid.requestDevice({ filters });
+      if (!device) return;
+      await device.open();
+      state.device = device; state.setupSent = false;
+      device.addEventListener('inputreport', onReport);
+      $('status').textContent = 'Connected: ' + device.productName;
+      $('connect').disabled = true;
+      await setLightbar(0, 0, 255);
+    } catch (e) {
+      $('status').innerHTML = '<span class="warn">' + e.message + '</span>';
+    }
+  };
+})();
+</script>
+</body>
+</html>
