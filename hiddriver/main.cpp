@@ -53,30 +53,94 @@ void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, X
 #if HIDDRIVER_FILELOG
 #define HIDLOG_LINES    512
 #define HIDLOG_LINE_LEN 160
-#define HIDLOG_NOTIFY_USB_SEEN   1
-#define HIDLOG_NOTIFY_GIP_FOUND  2
-#define HIDLOG_NOTIFY_GIP_READY  4
 static char g_logLines[HIDLOG_LINES][HIDLOG_LINE_LEN];
 static volatile LONG g_logHead = 0;      // total number of lines ever logged
 static LONG g_logFlushed = 0;            // lines already written to the file
-static volatile LONG g_logNotify = 0;    // HIDLOG_NOTIFY_* bits, shown by the flush thread
+// Plain counters bumped from the USB hooks, no formatting involved. The flush
+// thread turns changes into on screen notifications and log lines.
+static volatile LONG g_statHookCalls = 0;   // HidAddDeviceHook entered
+static volatile LONG g_statGipFound = 0;    // GIP interface matched
+static volatile LONG g_statGipReady = 0;    // GIP pad registered, power on queued
+
+// Minimal printf: %d %u %x %X %p %s %c %% with optional 0-padding width.
+// Used instead of the CRT so logging is safe from USB completion context.
+static void HidLogFormat(char* out, size_t cap, const char* fmt, va_list ap) {
+	size_t o = 0;
+	const char* digits = "0123456789abcdef";
+	const char* DIGITS = "0123456789ABCDEF";
+	while (*fmt && o + 1 < cap) {
+		if (*fmt != '%') { out[o++] = *fmt++; continue; }
+		fmt++;
+		if (*fmt == '%') { out[o++] = '%'; fmt++; continue; }
+		bool zero = false; int width = 0;
+		if (*fmt == '0') { zero = true; fmt++; }
+		while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+		while (*fmt == 'l' || *fmt == 'h') fmt++;
+		char tmp[24]; int n = 0; bool neg = false;
+		char spec = *fmt ? *fmt++ : 0;
+		if (spec == 's') {
+			const char* s = va_arg(ap, const char*); if (!s) s = "(null)";
+			while (*s && o + 1 < cap) out[o++] = *s++;
+			continue;
+		}
+		if (spec == 'c') { out[o++] = (char)va_arg(ap, int); continue; }
+		uint32_t v; int base = 10; const char* dg = digits;
+		if (spec == 'd' || spec == 'i') { int32_t sv = va_arg(ap, int32_t); neg = sv < 0; v = neg ? (uint32_t)(-sv) : (uint32_t)sv; }
+		else if (spec == 'u') { v = va_arg(ap, uint32_t); }
+		else if (spec == 'x' || spec == 'p') { v = va_arg(ap, uint32_t); base = 16; }
+		else if (spec == 'X') { v = va_arg(ap, uint32_t); base = 16; dg = DIGITS; }
+		else { out[o++] = '?'; continue; }
+		if (spec == 'p') { zero = true; width = 8; }
+		do { tmp[n++] = dg[v % base]; v /= base; } while (v && n < 23);
+		if (neg) tmp[n++] = '-';
+		while (n < width && n < 23) tmp[n++] = zero ? '0' : ' ';
+		while (n > 0 && o + 1 < cap) out[o++] = tmp[--n];
+	}
+	out[o] = 0;
+}
 
 int HidLogPrint(const char* fmt, ...) {
 	char buf[HIDLOG_LINE_LEN];
 	va_list ap;
 	va_start(ap, fmt);
-	_vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	HidLogFormat(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	buf[sizeof(buf) - 1] = 0;
 	DbgPrint("%s", buf);
 	LONG idx = InterlockedIncrement(&g_logHead) - 1;
 	memcpy(g_logLines[idx % HIDLOG_LINES], buf, HIDLOG_LINE_LEN);
 	return 0;
 }
 
+static void HidLogStatus(const char* why) {
+	HidLogPrint("EINTIM: [%s] hook calls=%d gip found=%d gip ready=%d\n",
+		why, g_statHookCalls, g_statGipFound, g_statGipReady);
+}
+
 unsigned int __stdcall LogFlushThreadProc(void* param) {
+	LONG seenHook = 0, seenFound = 0, seenReady = 0;
+	bool announced = false;
 	while (true) {
-		Sleep(500);
+		if (!announced) {
+			std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
+			if (f.is_open()) {
+				f << "=== hiddriver log start, build " << __DATE__ << " " << __TIME__ << " ===" << std::endl;
+				announced = true;
+				HidLogStatus("flush thread up");
+			}
+		}
+		if (g_statHookCalls != seenHook) {
+			seenHook = g_statHookCalls;
+			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: USB device reached HID hook");
+			HidLogStatus("hook");
+		}
+		if (g_statGipFound != seenFound) {
+			seenFound = g_statGipFound;
+			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP (Xbox One/Series) pad detected");
+		}
+		if (g_statGipReady != seenReady) {
+			seenReady = g_statGipReady;
+			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP pad registered, sent power on");
+		}
 		LONG head = g_logHead;
 		if (head != g_logFlushed) {
 			std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
@@ -87,17 +151,14 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 					f << g_logLines[g_logFlushed % HIDLOG_LINES];
 			}
 		}
-		LONG n = InterlockedExchange(&g_logNotify, 0);
-		if (n & HIDLOG_NOTIFY_USB_SEEN)  XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: USB device reached HID hook");
-		if (n & HIDLOG_NOTIFY_GIP_FOUND) XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP (Xbox One/Series) pad detected");
-		if (n & HIDLOG_NOTIFY_GIP_READY) XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP pad registered, sent power on");
+		Sleep(500);
 	}
 	return 0;
 }
 #define DbgPrint HidLogPrint
-#define HIDLOG_NOTIFY(bit) (g_logNotify |= (bit))
+#define HIDLOG_COUNT(counter) InterlockedIncrement(&(counter))
 #else
-#define HIDLOG_NOTIFY(bit) ((void)0)
+#define HIDLOG_COUNT(counter) ((void)0)
 #endif
 
 struct UsbTrb {
@@ -753,7 +814,7 @@ int32_t gipSetConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	}
 
 	GipQueueInitPackets(globalIndex);
-	HIDLOG_NOTIFY(HIDLOG_NOTIFY_GIP_READY);
+	HIDLOG_COUNT(g_statGipReady);
 
 	return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
 }
@@ -1587,6 +1648,7 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 
 int reportData = 0;
 int HidAddDeviceHook(deviceHandle* deviceHandle) {
+	HIDLOG_COUNT(g_statHookCalls);
 	DbgPrint("EINTIM: HID add device %p\n", deviceHandle);
 	usb_device_descriptor* device_descriptor = UsbdGetDeviceDescriptor(deviceHandle);
 	usb_interface_descriptor* interface_descriptor = UsbdGetInterfaceDescriptor(deviceHandle);
@@ -1603,12 +1665,11 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: Interface %d class %02x subclass %02x protocol %02x\n",
 		interface_descriptor->bInterfaceNumber, interface_descriptor->bInterfaceClass,
 		interface_descriptor->bInterfaceSubClass, interface_descriptor->bInterfaceProtocol);
-	HIDLOG_NOTIFY(HIDLOG_NOTIFY_USB_SEEN);
 
 	// Xbox One / Series pads expose three GIP interfaces, the gamepad is interface 0
 	if (IsGipInterface(interface_descriptor) && interface_descriptor->bInterfaceNumber == 0) {
 		DbgPrint("EINTIM: GIP controller detected. Initialising GIP handler.\n");
-		HIDLOG_NOTIFY(HIDLOG_NOTIFY_GIP_FOUND);
+		HIDLOG_COUNT(g_statGipFound);
 
 		int index = -1;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -2019,6 +2080,17 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		if (!LoadMappingsFromFile("HDD:\\hiddriver.json")) {
 			DbgPrint("EINTIM: Failed to load mappings(JSON either doesn't exist yet or syntax error)!\r\n");
 		}
+
+#if HIDDRIVER_FILELOG
+		{
+			// Written synchronously while still inside DllMain: proves the plugin
+			// loaded and that HDD: is reachable at plugin load time.
+			std::ofstream marker("HDD:\\hiddriver_boot.txt", std::ios::app);
+			if (marker.is_open())
+				marker << "hiddriver loaded, build " << __DATE__ << " " << __TIME__ << " kernel " << XboxKrnlVersion->Build << std::endl;
+			DbgPrint("EINTIM: boot marker %s\n", marker.is_open() ? "written" : "FAILED (HDD: not reachable yet)");
+		}
+#endif
 
 		if (isDevkit) {
 			HidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook); // 7D 88 02 A6 ? ? ? ? 94 21 ? ? 7C 7C 1B 78 ? ? ? ? 7C 7F 1B 79
