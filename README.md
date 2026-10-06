@@ -21,6 +21,19 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - Any USB HID compliant controller thanks to built in mapping assistant :)
 - Xbox One / Xbox Series controllers over USB (GIP, see below) - experimental
 
+## DualSense tilt steering (Gran Turismo style)
+Click the touchpad on a USB DualSense to toggle tilt steering. While it is on, the roll
+angle of the pad held like a steering wheel drives the left stick X axis (LY stays on the
+physical stick) and the lightbar turns red; click again to go back (lightbar blue).
+Tuning constants live in `hiddriver/dualsense.h` (`DS_TILT_*`), `HIDDRIVER_DS_TILT 0`
+compiles the feature out.
+
+Try it on the PC first: `tools/motion_demo/index.html` uses the same integer math over
+WebHID. Run `python -m http.server 8000` in the repo root, open
+`http://localhost:8000/tools/motion_demo/` in Chrome or Edge with the pad on a USB cable,
+connect, click the touchpad and rotate the pad. The page shows the computed stick and prints
+the `#define` values to copy into `dualsense.h` if you change the sliders.
+
 ## Xbox One / Series (GIP) support
 Modern Xbox pads are not HID, they talk Microsoft's vendor specific GIP protocol
 (interface class 0xFF, subclass 0x47, protocol 0xD0). This fork adds a second,
