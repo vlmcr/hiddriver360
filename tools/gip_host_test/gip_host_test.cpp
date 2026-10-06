@@ -127,6 +127,10 @@ static int XamUserBindDeviceCallback(unsigned int, unsigned int, uint8_t, bool, 
 	return 0;
 }
 
+// diagnostics counters used by the GIP section on the console
+static volatile LONG g_statGipReady = 0;
+#define HIDLOG_COUNT(counter) ((void)0)
+
 #include "gip_section.inc"
 
 // ---- test helpers ----------------------------------------------------------
