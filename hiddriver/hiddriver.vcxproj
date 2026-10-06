@@ -68,6 +68,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <SetChecksum>true</SetChecksum>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)hiddriver.map</MapFileName>
       <AdditionalOptions>/dll %(AdditionalOptions)</AdditionalOptions>
       <ProgramDatabaseFile>$(ProjectDir)$(Configuration)hiddriver.pdb</ProgramDatabaseFile>
       <EntryPointSymbol>

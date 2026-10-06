@@ -2426,6 +2426,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		}
 
 		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
+		DbgPrint("EINTIM: load addresses: DllMain=%p interruptHandler=%p connectedControllers=%p (compare with the .map file)\n", (DWORD)&DllMain, (DWORD)&interruptHandler, (DWORD)connectedControllers);
 		if (!initFunctionPointers())
 			return FALSE;
 
