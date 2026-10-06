@@ -157,27 +157,78 @@ static void HidLogStatus(const char* why) {
 		why, g_statHookCalls, g_statGipFound, g_statGipReady);
 }
 
+// Kernel inspection: find the HID class driver's registration record by
+// looking for pointers to its AddDevice / RemoveDevice routines in the kernel
+// image, and dump code of the Usbd driver-object exports for offline
+// disassembly. Read-only; every page is checked with MmIsAddressValid first.
+typedef BOOL(*mm_is_address_valid_func_t)(PVOID address);
+static mm_is_address_valid_func_t pMmIsAddressValid = nullptr;
+static void* pUsbdRegisterDriverObject = nullptr;
+static void* pUsbdGetRequiredDrivers = nullptr;
+static DWORD g_hidAddDeviceAddr = 0;
+static DWORD g_hidRemoveDeviceAddr = 0;
+static char g_logChunk[4096];
+
+static bool HidLogPageValid(DWORD addr) {
+	return pMmIsAddressValid && pMmIsAddressValid((PVOID)addr) != 0;
+}
+
+static void HidLogHexDump(const char* tag, DWORD start, DWORD length) {
+	for (DWORD off = 0; off < length; off += 16) {
+		DWORD a = start + off;
+		if (!HidLogPageValid(a) || !HidLogPageValid(a + 15)) {
+			HidLogPrint("%s %p: <unmapped>\n", tag, a);
+			continue;
+		}
+		const uint8_t* p = (const uint8_t*)a;
+		HidLogPrint("%s %p: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n", tag, a,
+			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+	}
+}
+
+static void HidLogKernelScan() {
+	HidLogPrint("EINTIM: kernel scan start, HidAddDevice=%p HidRemoveDevice=%p RegisterDriverObject=%p GetRequiredDrivers=%p\n",
+		g_hidAddDeviceAddr, g_hidRemoveDeviceAddr, pUsbdRegisterDriverObject, pUsbdGetRequiredDrivers);
+	if (!pMmIsAddressValid) {
+		HidLogPrint("EINTIM: MmIsAddressValid not resolved, skipping scan\n");
+		return;
+	}
+	int hits = 0;
+	for (DWORD page = 0x80000000; page < 0x80400000 && hits < 8; page += 0x1000) {
+		if (!HidLogPageValid(page))
+			continue;
+		for (DWORD a = page; a < page + 0x1000 && hits < 8; a += 4) {
+			DWORD v = *(volatile DWORD*)a;
+			if (v == g_hidAddDeviceAddr || v == g_hidRemoveDeviceAddr) {
+				hits++;
+				HidLogPrint("EINTIM: pointer to %s found at %p\n", v == g_hidAddDeviceAddr ? "HidAddDevice" : "HidRemoveDevice", a);
+				HidLogHexDump("drvobj", a - 0x40, 0x100);
+			}
+		}
+	}
+	HidLogPrint("EINTIM: kernel scan done, %d hit(s)\n", hits);
+	if (pUsbdRegisterDriverObject)
+		HidLogHexDump("regdrv", (DWORD)pUsbdRegisterDriverObject, 0x200);
+	if (pUsbdGetRequiredDrivers)
+		HidLogHexDump("reqdrv", (DWORD)pUsbdGetRequiredDrivers, 0x100);
+	HidLogPrint("EINTIM: code dumps done\n");
+}
+
 unsigned int __stdcall LogFlushThreadProc(void* param) {
 	LONG seenHook = 0, seenFound = 0, seenReady = 0;
 	bool announced = false;
+	int iteration = 0;
 	while (true) {
 		if (!announced) {
 			const char* start = "=== hiddriver log start, build " __DATE__ " " __TIME__ " ===\r\n";
-			NTSTATUS st = NtAppendText(HIDLOG_NT_PATH, start, strlen(start));
-			if (st >= 0) {
+			if (NtAppendText(HIDLOG_NT_PATH, start, strlen(start)) >= 0) {
 				announced = true;
 				HidLogStatus("flush thread up");
 			}
-			else {
-				std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
-				if (f.is_open()) {
-					f << start;
-					announced = true;
-					HidLogPrint("EINTIM: NT path log open failed %x, using HDD: path\n", st);
-					HidLogStatus("flush thread up");
-				}
-			}
 		}
+		// One-shot kernel inspection, well after boot so it never touches the boot path
+		if (announced && ++iteration == 30)
+			HidLogKernelScan();
 		if (g_statHookCalls != seenHook) {
 			seenHook = g_statHookCalls;
 			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: USB device reached HID hook");
@@ -195,22 +246,16 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 		if (head != g_logFlushed) {
 			if (head - g_logFlushed > HIDLOG_LINES)
 				g_logFlushed = head - HIDLOG_LINES;   // ring overflowed, skip lost lines
-			char chunk[HIDLOG_LINES * HIDLOG_LINE_LEN / 8];
 			size_t used = 0;
 			for (; g_logFlushed < head; g_logFlushed++) {
 				const char* line = g_logLines[g_logFlushed % HIDLOG_LINES];
 				size_t len = strlen(line);
-				if (used + len >= sizeof(chunk)) break;
-				memcpy(chunk + used, line, len);
+				if (used + len >= sizeof(g_logChunk)) break;
+				memcpy(g_logChunk + used, line, len);
 				used += len;
 			}
-			if (used) {
-				if (NtAppendText(HIDLOG_NT_PATH, chunk, used) < 0) {
-					std::ofstream f("HDD:\\hiddriver.log", std::ios::app);
-					if (f.is_open())
-						f.write(chunk, used);
-				}
-			}
+			if (used)
+				NtAppendText(HIDLOG_NT_PATH, g_logChunk, used);
 		}
 		Sleep(500);
 	}
@@ -2068,6 +2113,9 @@ bool initFunctionPointers() {
 	XexGetProcedureAddress(kernelHandle, 210, &pNtCreateFile);
 	XexGetProcedureAddress(kernelHandle, 255, &pNtWriteFile);
 	XexGetProcedureAddress(kernelHandle, 207, &pNtClose);
+	XexGetProcedureAddress(kernelHandle, 191, &pMmIsAddressValid);
+	XexGetProcedureAddress(kernelHandle, 755, &pUsbdRegisterDriverObject);
+	XexGetProcedureAddress(kernelHandle, 754, &pUsbdGetRequiredDrivers);
 #endif
 
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
@@ -2153,21 +2201,19 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 			// loaded and that HDD: is reachable at plugin load time.
 			const char* text = "hiddriver loaded, build " __DATE__ " " __TIME__ "\r\n";
 			NTSTATUS st = NtAppendText(HIDLOG_NT_MARKER, text, strlen(text));
-			std::ofstream marker("HDD:\\hiddriver_boot.txt", std::ios::app);
-			if (marker.is_open())
-				marker << "hiddriver loaded via HDD: path, build " << __DATE__ << " " << __TIME__ << std::endl;
-			DbgPrint("EINTIM: boot marker NT path status %x, HDD: path %s\n", st, marker.is_open() ? "ok" : "FAILED");
-			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver loaded (GIP build)");
+			DbgPrint("EINTIM: boot marker NT path status %x\n", st);
 		}
 #endif
 
 		if (isDevkit) {
 			HidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook); // 7D 88 02 A6 ? ? ? ? 94 21 ? ? 7C 7C 1B 78 ? ? ? ? 7C 7F 1B 79
 			HidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook); // 81 63 ? ? 39 40 ? ? 39 20 ? ? 99 4B
+			g_hidAddDeviceAddr = 0x8011AE38; g_hidRemoveDeviceAddr = 0x8011ADF8;
 		}
 		else {
 			HidAddDeviceDetour = Detour((void*)0x800E4D68, (void*)HidAddDeviceHook); // 7D 88 02 A6 ? ? ? ? 94 21 ? ? 7C 7B 1B 78 ? ? ? ? 7C 7F 1B 79
 			HidRemoveDeviceDetour = Detour((void*)0x800E4D28, (void*)HidRemoveDeviceHook); // 81 63 ? ? 39 40 ? ? 39 20 ? ? 99 4B
+			g_hidAddDeviceAddr = 0x800E4D68; g_hidRemoveDeviceAddr = 0x800E4D28;
 		}
 
 		HidAddDeviceDetour.Install();
