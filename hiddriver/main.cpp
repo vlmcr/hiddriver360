@@ -541,6 +541,13 @@ struct Controller {
 	bool dsLightbarSetupSent;
 } __declspec(align(4));
 
+// Atomics on PowerPC fault on misaligned addresses: pin the layout at compile time.
+static_assert(offsetof(Controller, gipOutBusy) % 4 == 0, "gipOutBusy misaligned");
+static_assert(offsetof(Controller, gipRumblePending) % 4 == 0, "gipRumblePending misaligned");
+static_assert(offsetof(Controller, dsOutBusy) % 4 == 0, "dsOutBusy misaligned");
+static_assert(offsetof(Controller, dsLightbarPending) % 4 == 0, "dsLightbarPending misaligned");
+static_assert(sizeof(Controller) % 4 == 0, "Controller size not a multiple of 4");
+
 struct MappingState {
 	volatile bool active;
 	volatile uint8_t pressedButtonIdx;
@@ -1022,8 +1029,10 @@ void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
 	ctl.dsLightbar[0] = red;
 	ctl.dsLightbar[1] = green;
 	ctl.dsLightbar[2] = blue;
+#if HIDDRIVER_DS_LIGHTBAR
 	InterlockedExchange(&ctl.dsLightbarPending, 1);
 	// sent by DsPumpOut from the background thread, never from USB context
+#endif
 }
 
 // Opens the interrupt OUT endpoint on the final controller slot, the same way
@@ -1260,8 +1269,12 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 
 #if HIDDRIVER_DS_TILT
 		if (IsDualSense(c.vendorId, c.productId)) {
+#if HIDDRIVER_DS_LIGHTBAR
 			if (!NT_ERROR(DsOpenOutEndpoint(globalIndex)))
 				DsSetLightbar(globalIndex, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
+#else
+			DbgPrint("EINTIM: DualSense lightbar support compiled out\n");
+#endif
 		}
 #endif
 

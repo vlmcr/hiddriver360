@@ -56,6 +56,11 @@ static const uint16_t ds_atan_table[65] = {
 static_assert(DS_TILT_MAX_DEG10 > DS_TILT_DEADZONE_DEG10, "full lock angle must exceed the dead zone");
 #endif
 
+// Set to 0 to keep tilt steering but never touch the lightbar (diagnostics).
+#ifndef HIDDRIVER_DS_LIGHTBAR
+#define HIDDRIVER_DS_LIGHTBAR 1
+#endif
+
 // Set to 0 to compile without the tilt steering mode.
 #ifndef HIDDRIVER_DS_TILT
 #define HIDDRIVER_DS_TILT 1
