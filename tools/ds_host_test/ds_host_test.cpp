@@ -35,9 +35,11 @@ struct Controller {
 	HidControllerExtension* controllerDriver;
 	ButtonsReport currentState;
 	uint16_t vendorId, productId;
-	bool dsTiltSteering; uint8_t dsTouchpadPrev; uint16_t dsToggleHoldoff; uint16_t dsSteerDelay; uint16_t dsTraceCounter; int32_t dsSteerFiltered;
-	UsbTrb dsOutTrb; uint8_t* dsOutBuffer; bool dsOutOpened; bool dsOutFailed; uint16_t dsReportsSinceSend;
+	bool dsTiltSteering; uint8_t dsTouchpadPrev; uint16_t dsToggleHoldoff; int32_t dsSteerFiltered;
+	bool dsOutOpened; bool dsOutFailed; uint16_t dsReportsSinceSend;
 	volatile LONG dsLightbarPending; uint8_t dsLightbar[3]; bool dsLightbarSetupSent;
+	uint8_t dsOutReport[DS_OUTPUT_BUFFER_SIZE];
+	UsbTrb dsOutTrb; BYTE dsOutTrbGuard[64];   // must stay last, see main.cpp
 };
 static Controller connectedControllers[4];
 
@@ -81,8 +83,9 @@ int main() {
 	printf("== first report: lazy open + idle colour from the callback ==\n");
 	report(r, false, 0, 8192, 0);
 	settle(0, r, 1);
-	CHECK(c.dsOutOpened && !c.dsOutFailed && c.dsOutBuffer != NULL, "OUT endpoint opened on first input report");
-	CHECK(g_sent.size() == 1 && g_sent[0].data.size() == 48, "blue report queued immediately from the callback");
+	CHECK(c.dsOutOpened && !c.dsOutFailed, "OUT endpoint opened on first input report");
+	CHECK(g_sent.size() == 1 && g_sent[0].data.size() == 63, "63 byte blue report queued immediately from the callback");
+	CHECK(g_sent[0].trb == &c.dsOutTrb && (const uint8_t*)g_sent[0].trb > c.dsOutReport, "transfer uses the trailing OUT TRB, report buffer lies before it");
 	{ std::vector<uint8_t>& d = g_sent[0].data;
 	  CHECK(d[0] == 0x02 && d[2] == 0x04, "report 0x02 with lightbar control flag");
 	  CHECK(d[39] == 0x02 && d[42] == 0x02, "first report carries LIGHT_OUT setup");
@@ -103,7 +106,6 @@ int main() {
 	CHECK(g_sent.size() == 2 && g_sent[1].data[45] == 255 && g_sent[1].data[47] == 0, "red sent after the spacing window");
 	CHECK(g_sent[1].data[39] == 0, "second report has no setup bytes");
 
-	c.dsSteerDelay = 0;                              // skip the start delay for the math checks
 	report(r, false, 5793, 5793, 0);                 // 45 degrees, tilt so ax is positive
 	int16_t lx = settle(0, r, 40);
 	CHECK(lx == -32767, "45 degree roll with positive ax = full stick LEFT (-32767)");
@@ -141,7 +143,7 @@ int main() {
 	c2.deviceHandle = &dev; c2.controllerDriver = &ext; c2.vendorId = 0x054C; c2.productId = 0x0DF2;
 	g_noOut = true; before = g_sent.size();
 	settle(1, r, 3);
-	CHECK(c2.dsOutOpened && c2.dsOutFailed && c2.dsOutBuffer == NULL && g_sent.size() == before, "open failure recorded, nothing sent");
+	CHECK(c2.dsOutOpened && c2.dsOutFailed && g_sent.size() == before, "open failure recorded, nothing sent");
 	report(r, true, 0, 8192, 0); settle(1, r, 1);
 	CHECK(c2.dsTiltSteering, "toggle still works without a lightbar");
 	g_noOut = false;

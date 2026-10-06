@@ -25,6 +25,11 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 Click the touchpad on a USB DualSense to toggle tilt steering. While it is on, the roll
 angle of the pad held like a steering wheel drives the left stick X axis (LY stays on the
 physical stick) and the lightbar turns red; click again to go back (lightbar blue).
+The lightbar is set with the full 63 byte USB output report 0x02 on the pad's interrupt OUT
+endpoint. Contributor note: the `UsbTrb` used for that write is reverse engineered and the
+kernel writes past it, so it must stay the last member of `Controller` with the guard bytes
+after it (a pointer placed after it crashed the console on every write).
+
 Tuning constants live in `hiddriver/dualsense.h` (`DS_TILT_*`), `HIDDRIVER_DS_TILT 0`
 compiles the feature out.
 

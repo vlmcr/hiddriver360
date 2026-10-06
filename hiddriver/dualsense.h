@@ -19,7 +19,8 @@
 #define DS_IN_ACCEL_Z           26
 
 #define DS_OUTPUT_REPORT_USB    0x02
-#define DS_OUTPUT_REPORT_SIZE   48
+#define DS_OUTPUT_REPORT_SIZE   63      // full USB output report, as in Linux hid-playstation
+#define DS_OUTPUT_BUFFER_SIZE   64
 #define DS_OUT_VALID_FLAG1      2
 #define DS_FLAG1_LIGHTBAR_CONTROL       0x04
 #define DS_OUT_VALID_FLAG2      39
@@ -36,7 +37,6 @@
 #define DS_TILT_FILTER_SHIFT    2       // exponential smoothing, new sample weight 1/4
 #define DS_TILT_INVERT          0       // 0 = negate roll (left tilt -> stick left), 1 = opposite
 #define DS_TILT_TOGGLE_HOLDOFF  25      // reports to ignore after a toggle (~100 ms), masks switch bounce
-#define DS_TILT_START_DELAY     500     // reports (~2 s) between switching on and applying steering
 #define DS_LIGHTBAR_MIN_SPACING 50      // input reports between two lightbar writes (~200 ms)
 
 #define DS_LIGHTBAR_ON_R  255

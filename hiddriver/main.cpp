@@ -258,7 +258,7 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 			if (used)
 				NtAppendText(HIDLOG_NT_PATH, g_logChunk, used);
 		}
-		Sleep(20);
+		Sleep(100);
 	}
 	return 0;
 }
@@ -523,23 +523,28 @@ struct Controller {
 	bool dsTiltSteering;              // touchpad click toggles this
 	uint8_t dsTouchpadPrev;           // last touchpad click bit, for edge detection
 	uint16_t dsToggleHoldoff;         // reports left to ignore after a toggle
-	uint16_t dsSteerDelay;            // reports to wait after switching on before steering is applied
-	uint16_t dsTraceCounter;          // throttles the per-report trace line
 	int32_t dsSteerFiltered;          // smoothed steering value
-	UsbTrb dsOutTrb;                  // interrupt OUT endpoint for the lightbar report
-	uint8_t* dsOutBuffer;             // 48 byte output report in flight
 	bool dsOutOpened;                 // OUT endpoint opened (lazily, from the input callback)
 	bool dsOutFailed;                 // opening failed, lightbar disabled for this pad
 	uint16_t dsReportsSinceSend;      // input reports seen since the last lightbar write
 	volatile LONG dsLightbarPending;
 	uint8_t dsLightbar[3];
 	bool dsLightbarSetupSent;
+	uint8_t dsOutReport[DS_OUTPUT_BUFFER_SIZE];   // output report handed to the kernel, inline on purpose
+	// The OUT transfer block MUST stay the last member. UsbTrb is reverse engineered
+	// and the kernel writes past its 28 bytes; the guard absorbs that instead of
+	// whatever field would otherwise follow (a pointer here crashed the console).
+	UsbTrb dsOutTrb;
+	BYTE dsOutTrbGuard[64];
 } __declspec(align(4));
 
 // Atomics on PowerPC fault on misaligned addresses: pin the layout at compile time.
 static_assert(offsetof(Controller, gipOutBusy) % 4 == 0, "gipOutBusy misaligned");
 static_assert(offsetof(Controller, gipRumblePending) % 4 == 0, "gipRumblePending misaligned");
 static_assert(offsetof(Controller, dsLightbarPending) % 4 == 0, "dsLightbarPending misaligned");
+static_assert(offsetof(Controller, dsOutTrb) % 4 == 0, "dsOutTrb misaligned");
+static_assert(offsetof(Controller, dsOutTrbGuard) == offsetof(Controller, dsOutTrb) + sizeof(UsbTrb), "guard must follow the OUT TRB");
+static_assert(offsetof(Controller, dsOutTrbGuard) + 64 == sizeof(Controller), "OUT TRB + guard must end the Controller");
 static_assert(sizeof(Controller) % 4 == 0, "Controller size not a multiple of 4");
 
 struct MappingState {
@@ -975,15 +980,15 @@ static inline int16_t ds_s16(const uint8_t* p) {
 // Build and queue the pending lightbar report. USB callback context only.
 void DsPumpOut(int index) {
 	Controller& ctl = connectedControllers[index];
-	if (!ctl.controllerDriver || !ctl.dsOutOpened || !ctl.dsOutBuffer || !ctl.dsLightbarPending)
+	if (!ctl.controllerDriver || !ctl.dsOutOpened || ctl.dsOutFailed || !ctl.dsLightbarPending)
 		return;
 	if (ctl.dsReportsSinceSend < DS_LIGHTBAR_MIN_SPACING)
 		return;
 	InterlockedExchange(&ctl.dsLightbarPending, 0);
 	ctl.dsReportsSinceSend = 0;
 
-	uint8_t* r = ctl.dsOutBuffer;
-	memset(r, 0, DS_OUTPUT_REPORT_SIZE);
+	uint8_t* r = ctl.dsOutReport;
+	memset(r, 0, DS_OUTPUT_BUFFER_SIZE);
 	r[0] = DS_OUTPUT_REPORT_USB;
 	r[DS_OUT_VALID_FLAG1] = DS_FLAG1_LIGHTBAR_CONTROL;
 	if (!ctl.dsLightbarSetupSent) {
@@ -1034,8 +1039,7 @@ void DsOpenOutEndpoint(int index) {
 		ctl.dsOutFailed = true;
 		return;
 	}
-	ctl.dsOutBuffer = (uint8_t*)malloc(DS_OUTPUT_REPORT_SIZE);
-	memset(ctl.dsOutBuffer, 0, DS_OUTPUT_REPORT_SIZE);
+	memset(ctl.dsOutReport, 0, DS_OUTPUT_BUFFER_SIZE);
 	ctl.dsReportsSinceSend = DS_LIGHTBAR_MIN_SPACING;   // first write may go out at once
 	DbgPrint("EINTIM: DualSense OUT endpoint %02x opened\n", outDescriptor->bEndpointAddress);
 }
@@ -1116,8 +1120,6 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 		ctl.dsTiltSteering = !ctl.dsTiltSteering;
 		ctl.dsSteerFiltered = 0;
 		ctl.dsToggleHoldoff = DS_TILT_TOGGLE_HOLDOFF;
-		ctl.dsSteerDelay = DS_TILT_START_DELAY;
-		ctl.dsTraceCounter = 0;
 		DbgPrint("EINTIM: DualSense tilt steering %s\n", ctl.dsTiltSteering ? "ON" : "OFF");
 		if (ctl.dsTiltSteering)
 			DsSetLightbar(index, DS_LIGHTBAR_ON_R, DS_LIGHTBAR_ON_G, DS_LIGHTBAR_ON_B);
@@ -1127,20 +1129,10 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 	ctl.dsTouchpadPrev = touch;
 
 	if (ctl.dsTiltSteering) {
-		if (ctl.dsSteerDelay > 0) {
-			// grace period after switching on: lightbar first, steering later
-			ctl.dsSteerDelay--;
-			if (ctl.dsSteerDelay == 0)
-				DbgPrint("EINTIM: DualSense steering active\n");
-		}
-		else {
-		int32_t ax = ds_s16(report + DS_IN_ACCEL_X);
-		int32_t ay = ds_s16(report + DS_IN_ACCEL_Y);
-		int32_t az = ds_s16(report + DS_IN_ACCEL_Z);
-		out->x = DsRollToSteer(ctl, ax, ay, az);
-		if ((++ctl.dsTraceCounter & 15) == 0)
-			DbgPrint("EINTIM: tilt ax=%d ay=%d az=%d lx=%d\n", ax, ay, az, (int32_t)out->x);
-		}
+		out->x = DsRollToSteer(ctl,
+			ds_s16(report + DS_IN_ACCEL_X),
+			ds_s16(report + DS_IN_ACCEL_Y),
+			ds_s16(report + DS_IN_ACCEL_Z));
 	}
 
 #if HIDDRIVER_DS_LIGHTBAR
@@ -1970,10 +1962,6 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 		if (connectedControllers[index].gipOutBuffer) {
 			free(connectedControllers[index].gipOutBuffer);
 			connectedControllers[index].gipOutBuffer = nullptr;
-		}
-		if (connectedControllers[index].dsOutBuffer) {
-			free(connectedControllers[index].dsOutBuffer);
-			connectedControllers[index].dsOutBuffer = nullptr;
 		}
 		memset(&connectedControllers[index], 0, sizeof(Controller));
 		delete deviceHandle2->driver;
