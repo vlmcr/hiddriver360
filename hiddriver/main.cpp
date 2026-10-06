@@ -215,10 +215,6 @@ static void HidLogKernelScan() {
 	HidLogPrint("EINTIM: code dumps done\n");
 }
 
-#if HIDDRIVER_DS_TILT
-void DsPumpAllPending();   // defined in the DualSense section, needs connectedControllers
-#endif
-
 unsigned int __stdcall LogFlushThreadProc(void* param) {
 	LONG seenHook = 0, seenFound = 0, seenReady = 0;
 	bool announced = false;
@@ -247,9 +243,6 @@ unsigned int __stdcall LogFlushThreadProc(void* param) {
 			seenReady = g_statGipReady;
 			XNotifyUI(XNOTIFYUI_CUSTOM, L"hiddriver: GIP pad registered, sent power on");
 		}
-#if HIDDRIVER_DS_TILT
-		DsPumpAllPending();
-#endif
 		LONG head = g_logHead;
 		if (head != g_logFlushed) {
 			if (head - g_logFlushed > HIDLOG_LINES)
@@ -535,7 +528,9 @@ struct Controller {
 	int32_t dsSteerFiltered;          // smoothed steering value
 	UsbTrb dsOutTrb;                  // interrupt OUT endpoint for the lightbar report
 	uint8_t* dsOutBuffer;             // 48 byte output report in flight
-	volatile LONG dsOutBusy;
+	bool dsOutOpened;                 // OUT endpoint opened (lazily, from the input callback)
+	bool dsOutFailed;                 // opening failed, lightbar disabled for this pad
+	uint16_t dsReportsSinceSend;      // input reports seen since the last lightbar write
 	volatile LONG dsLightbarPending;
 	uint8_t dsLightbar[3];
 	bool dsLightbarSetupSent;
@@ -544,7 +539,6 @@ struct Controller {
 // Atomics on PowerPC fault on misaligned addresses: pin the layout at compile time.
 static_assert(offsetof(Controller, gipOutBusy) % 4 == 0, "gipOutBusy misaligned");
 static_assert(offsetof(Controller, gipRumblePending) % 4 == 0, "gipRumblePending misaligned");
-static_assert(offsetof(Controller, dsOutBusy) % 4 == 0, "dsOutBusy misaligned");
 static_assert(offsetof(Controller, dsLightbarPending) % 4 == 0, "dsLightbarPending misaligned");
 static_assert(sizeof(Controller) % 4 == 0, "Controller size not a multiple of 4");
 
@@ -972,24 +966,21 @@ static inline int16_t ds_s16(const uint8_t* p) {
 	return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-int DsFindControllerByOutTrb(void* trb) {
-	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-		if (connectedControllers[i].controllerDriver && &connectedControllers[i].dsOutTrb == trb)
-			return i;
-	}
-	return -1;
-}
+// Lightbar writes follow the Switch Pro pattern that is proven on hardware:
+// the interrupt OUT endpoint is opened lazily from the input callback and the
+// report is queued from that same callback with a no-op completion. Writes are
+// spaced by DS_LIGHTBAR_MIN_SPACING input reports so a transfer is always
+// finished before the TRB is reused; no completion handler is needed.
 
-int32_t dsOutCompleteHandler(DWORD trbPtr, int32_t status);
-
-// Send the lightbar report if one is pending and the OUT endpoint is idle.
+// Build and queue the pending lightbar report. USB callback context only.
 void DsPumpOut(int index) {
 	Controller& ctl = connectedControllers[index];
-	if (!ctl.controllerDriver || !ctl.dsOutBuffer || !ctl.dsLightbarPending)
+	if (!ctl.controllerDriver || !ctl.dsOutOpened || !ctl.dsOutBuffer || !ctl.dsLightbarPending)
 		return;
-	if (InterlockedCompareExchange(&ctl.dsOutBusy, 1, 0) != 0)
-		return; // in flight, completion handler calls us again
+	if (ctl.dsReportsSinceSend < DS_LIGHTBAR_MIN_SPACING)
+		return;
 	InterlockedExchange(&ctl.dsLightbarPending, 0);
+	ctl.dsReportsSinceSend = 0;
 
 	uint8_t* r = ctl.dsOutBuffer;
 	memset(r, 0, DS_OUTPUT_REPORT_SIZE);
@@ -1004,24 +995,7 @@ void DsPumpOut(int index) {
 	r[DS_OUT_LIGHTBAR_G] = ctl.dsLightbar[1];
 	r[DS_OUT_LIGHTBAR_B] = ctl.dsLightbar[2];
 	DbgPrint("EINTIM: DualSense lightbar %d,%d,%d\n", r[DS_OUT_LIGHTBAR_R], r[DS_OUT_LIGHTBAR_G], r[DS_OUT_LIGHTBAR_B]);
-	SendInterruptRequest(ctl.deviceHandle, &ctl.dsOutTrb, r, DS_OUTPUT_REPORT_SIZE, (DWORD)dsOutCompleteHandler);
-}
-
-int32_t dsOutCompleteHandler(DWORD trbPtr, int32_t status) {
-	int index = DsFindControllerByOutTrb((void*)trbPtr);
-	if (index < 0)
-		return 0;
-	DbgPrint("EINTIM: DualSense OUT complete, status %x\n", status);
-	InterlockedExchange(&connectedControllers[index].dsOutBusy, 0);
-	return 0;
-}
-
-// Called from the background thread every 100 ms.
-void DsPumpAllPending() {
-	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-		if (connectedControllers[i].controllerDriver && connectedControllers[i].dsLightbarPending)
-			DsPumpOut(i);
-	}
+	SendInterruptRequest(ctl.deviceHandle, &ctl.dsOutTrb, r, DS_OUTPUT_REPORT_SIZE, (DWORD)noopCompleteHandler);
 }
 
 void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
@@ -1031,19 +1005,22 @@ void DsSetLightbar(int index, uint8_t red, uint8_t green, uint8_t blue) {
 	ctl.dsLightbar[2] = blue;
 #if HIDDRIVER_DS_LIGHTBAR
 	InterlockedExchange(&ctl.dsLightbarPending, 1);
-	// sent by DsPumpOut from the background thread, never from USB context
+	// queued by DsPumpOut from the input callback once the spacing allows
 #endif
 }
 
-// Opens the interrupt OUT endpoint on the final controller slot, the same way
-// the GIP path does. On failure the lightbar is simply never updated.
-NTSTATUS DsOpenOutEndpoint(int index) {
+// Opens the interrupt OUT endpoint exactly like the Switch Pro path does, from
+// the input callback on the final controller slot. On failure the lightbar is
+// simply never updated; input keeps working.
+void DsOpenOutEndpoint(int index) {
 	Controller& ctl = connectedControllers[index];
+	ctl.dsOutOpened = true;   // only one attempt
 	usb_endpoint_descriptor* outDescriptor = UsbdGetEndpointDescriptor(
 		ctl.deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
 	if (!outDescriptor) {
 		DbgPrint("EINTIM: DualSense has no interrupt OUT endpoint\n");
-		return -1;
+		ctl.dsOutFailed = true;
+		return;
 	}
 	NTSTATUS status = UsbdOpenEndpoint(
 		ctl.deviceHandle,
@@ -1054,12 +1031,13 @@ NTSTATUS DsOpenOutEndpoint(int index) {
 		(DWORD*)&ctl.dsOutTrb);
 	if (NT_ERROR(status)) {
 		DbgPrint("EINTIM: Failed to open DualSense OUT endpoint %x\n", status);
-		return status;
+		ctl.dsOutFailed = true;
+		return;
 	}
 	ctl.dsOutBuffer = (uint8_t*)malloc(DS_OUTPUT_REPORT_SIZE);
 	memset(ctl.dsOutBuffer, 0, DS_OUTPUT_REPORT_SIZE);
+	ctl.dsReportsSinceSend = DS_LIGHTBAR_MIN_SPACING;   // first write may go out at once
 	DbgPrint("EINTIM: DualSense OUT endpoint %02x opened\n", outDescriptor->bEndpointAddress);
-	return status;
 }
 
 uint32_t DsIsqrt32(uint32_t v) {
@@ -1121,6 +1099,16 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 	if (report[0] != DS_INPUT_REPORT_USB)
 		return;
 
+#if HIDDRIVER_DS_LIGHTBAR
+	if (!ctl.dsOutOpened) {
+		DsOpenOutEndpoint(index);
+		if (!ctl.dsOutFailed)
+			DsSetLightbar(index, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
+	}
+	if (ctl.dsReportsSinceSend < 0xFFFF)
+		ctl.dsReportsSinceSend++;
+#endif
+
 	uint8_t touch = (report[DS_IN_BUTTONS2] & DS_BTN2_TOUCHPAD) ? 1 : 0;
 	if (ctl.dsToggleHoldoff > 0)
 		ctl.dsToggleHoldoff--;
@@ -1144,15 +1132,20 @@ void DsProcessInputReport(int index, const uint8_t* report, ButtonsReport* out) 
 			ctl.dsSteerDelay--;
 			if (ctl.dsSteerDelay == 0)
 				DbgPrint("EINTIM: DualSense steering active\n");
-			return;
 		}
+		else {
 		int32_t ax = ds_s16(report + DS_IN_ACCEL_X);
 		int32_t ay = ds_s16(report + DS_IN_ACCEL_Y);
 		int32_t az = ds_s16(report + DS_IN_ACCEL_Z);
 		out->x = DsRollToSteer(ctl, ax, ay, az);
 		if ((++ctl.dsTraceCounter & 15) == 0)
 			DbgPrint("EINTIM: tilt ax=%d ay=%d az=%d lx=%d\n", ax, ay, az, (int32_t)out->x);
+		}
 	}
+
+#if HIDDRIVER_DS_LIGHTBAR
+	DsPumpOut(index);
+#endif
 }
 #endif
 // ---- DualSense specific end ----
@@ -1266,17 +1259,6 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		connectedControllers[globalIndex] = c;
 
 		DbgPrint("EINTIM: Registered virtual controller inside XAM with index: %d.\n", userIndex);
-
-#if HIDDRIVER_DS_TILT
-		if (IsDualSense(c.vendorId, c.productId)) {
-#if HIDDRIVER_DS_LIGHTBAR
-			if (!NT_ERROR(DsOpenOutEndpoint(globalIndex)))
-				DsSetLightbar(globalIndex, DS_LIGHTBAR_OFF_R, DS_LIGHTBAR_OFF_G, DS_LIGHTBAR_OFF_B);
-#else
-			DbgPrint("EINTIM: DualSense lightbar support compiled out\n");
-#endif
-		}
-#endif
 
 		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
 			DbgPrint("EINTIM: Sending dualshock3 handshake!\r\n");
